@@ -10,12 +10,13 @@ concurrency — the same wifi card that carries the internet.
 
 ## Status
 
-Early development. `doctor` inspects the machine; `start`/`stop` run the
-hotspot with the paywall (sell passes from the command line). The admin
-panel and captive portal are not built yet.
+Beta. `doctor` inspects the machine, `start`/`stop` run the hotspot with the
+paywall, the captive portal greets unpaid clients, and the admin panel sells
+passes from a phone browser.
 
-**While the hotspot runs, the wifi radio is spent on the access point** —
-the machine itself stops scanning and its own wifi connections drop.
+**While the hotspot runs in `hotspot` mode, the wifi radio is spent on the
+access point** — the machine itself stops scanning and its own wifi
+connections drop. `wifi-uplink` mode avoids that (see below).
 `piso-hotspot stop` hands the radio back to NetworkManager.
 
 ## Requirements
@@ -135,12 +136,69 @@ Configuration lives in `/etc/piso-hotspot/config.json` (all fields optional;
 `piso-hotspot doctor` shows whether yours exists). Pass prices, SSID,
 passphrase, gateway, channel, and client limits are all there.
 
+## The admin panel
+
+The panel runs inside the daemon and answers on the gateway
+(`http://10.10.0.1:8080`), on the machine itself, and on the uplink side —
+so **the phone can open it while the laptop is the one sharing the
+connection**, which is the whole point.
+
+- Log in with the admin passphrase. Set `admin.passphrase` in the config,
+  or leave it empty and a fresh random one is generated every start
+  (`piso-hotspot status` prints it).
+- Sessions are cookies, `HttpOnly` + `SameSite=Strict`, idle-expiring;
+  repeated wrong guesses lock out with a `Retry-After`.
+- **Dashboard**: revenue today, active passes, device counts, live traffic
+  moved/blocked, and one-tap sale buttons per configured pass.
+- **Devices**: every device with its live countdown and bytes used;
+  sell, revoke, friend/unfriend, and rename (the operator's label always
+  wins over what the device reports about itself).
+- **Settings**: appearance (auto/light/dark), pass and cap reference,
+  passphrase with copy, active sessions, and a shutdown button behind a
+  confirmation.
+
+Passes sold from the panel and from the CLI are the same transaction —
+both go through one dispatch path into the same store and firewall.
+
+## The captive portal
+
+Unpaid clients get an HTTP redirect from any address to the portal notice,
+served by the daemon on port 80 of the gateway. HTTPS is refused with a
+reset, never silently dropped, so browsers that try HTTPS first fall back
+to HTTP instead of hanging.
+
+The portal is what makes the sale obvious: a client opens any site, sees
+the operator's message, pays, and the pass starts working on the next
+packet.
+
 ## Development
 
 ```console
 cargo test          # unit tests, no root or hardware needed
 cargo run -- doctor # inspect this machine
 ```
+
+### Verification harness
+
+The paywall, portal, panel, DHCP and NAT path are exercised end-to-end on
+**virtual radios** (`mac80211_hwsim`) with a client in a network namespace
+and a veth pair standing in for the internet — the real wifi card is never
+touched. Two things the harness taught us, both now product behaviour:
+
+- UFW's INPUT chain runs before our nft rules; when it is active the
+  hotspot opens its ports there (and closes them at stop), scoped to the
+  AP interface.
+- dnsmasq is configured with `dhcp-broadcast`: it ARPs for a leaseless
+  client before unicasting the offer, which cannot resolve, so clients
+  whose stack does not answer ARP for a pending address never got a
+  lease. Broadcasting replies matches what AP firmware does.
+
+### Keeping it running with the lid shut
+
+A suspended machine drops every connection and stops enforcing the
+paywall. Disable sleep (on AC power) and screen blanking; the panel and
+paywall live in a background daemon, so closing the terminal changes
+nothing.
 
 ## License
 
