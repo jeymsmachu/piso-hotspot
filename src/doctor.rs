@@ -103,7 +103,6 @@ pub struct Tools {
     pub hostapd: bool,
     pub dnsmasq: bool,
     pub nft: bool,
-    pub bluetoothctl: bool,
 }
 
 impl Tools {
@@ -132,7 +131,6 @@ pub fn inspect() -> Report {
         hostapd: which("hostapd").is_some(),
         dnsmasq: which("dnsmasq").is_some(),
         nft: which("nft").is_some(),
-        bluetoothctl: which("bluetoothctl").is_some(),
     };
 
     let phy_caps: BTreeMap<String, iwlist::Phy> = which("iw")
@@ -182,7 +180,6 @@ pub fn inspect() -> Report {
                 &["hotspot", "dual-radio", "wifi-uplink"],
             ),
             dep("nft", tools.nft, &["hotspot", "dual-radio", "wifi-uplink"]),
-            dep("bluetoothctl", tools.bluetoothctl, &["bluetooth"]),
         ],
         radios,
         uplinks,
@@ -269,9 +266,11 @@ pub fn derive_modes(radios: &[Radio], uplinks: &[Uplink], tools: Tools) -> Vec<M
     let wired_uplink: Option<&Uplink> = uplinks
         .iter()
         .find(|u| matches!(u.kind, UplinkKind::Ethernet | UplinkKind::UsbTether));
-    let wifi_is_default = uplinks
+    // A radio whose station side is associated can carry the uplink.
+    // (Wifi interfaces are not in `uplinks`; the association is the uplink.)
+    let connected_station: Option<&Radio> = radios
         .iter()
-        .any(|u| u.kind == UplinkKind::Wifi && u.is_default_route);
+        .find(|r| r.station.as_ref().is_some_and(|s| s.connected));
 
     // hotspot: one radio becomes the AP, internet comes from elsewhere
     let hotspot = if !missing.is_empty() {
@@ -281,9 +280,23 @@ pub fn derive_modes(radios: &[Radio], uplinks: &[Uplink], tools: Tools) -> Vec<M
     } else if let Some(uplink) = wired_uplink {
         Mode::available(
             "hotspot",
-            format!("uplink {} ({:?})", uplink.iface, uplink.kind),
+            format!("uplink {} ({})", uplink.iface, kind_label(uplink.kind)),
         )
-    } else if wifi_is_default && radios.len() < 2 {
+    } else if let Some(station) = connected_station
+        && ap_radios.iter().any(|r| r.phy != station.phy)
+    {
+        Mode::available(
+            "hotspot",
+            format!(
+                "uplink over wifi station {}, AP on a second radio",
+                station
+                    .interfaces
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("?")
+            ),
+        )
+    } else if connected_station.is_some() && radios.len() < 2 {
         Mode::unavailable(
             "hotspot",
             "the only radio would be spent on the AP; plug in a USB-tethered \
@@ -298,26 +311,41 @@ pub fn derive_modes(radios: &[Radio], uplinks: &[Uplink], tools: Tools) -> Vec<M
     };
     modes.push(hotspot);
 
-    // dual-radio: one radio uplinks, another beacons
-    let dual = if !missing.is_empty() {
-        Mode::unavailable(
+    // dual-radio: one radio keeps its wifi association, another beacons
+    let dual = match connected_station {
+        _ if !missing.is_empty() => Mode::unavailable(
             "dual-radio",
             format!("missing tools: {}", missing.join(", ")),
-        )
-    } else if radios.len() < 2 {
-        Mode::unavailable("dual-radio", "only one radio present".to_string())
-    } else if !wifi_is_default {
-        Mode::unavailable(
+        ),
+        None => Mode::unavailable(
             "dual-radio",
             "no wifi station to uplink from (connect to wifi first)".to_string(),
-        )
-    } else if ap_radios.is_empty() {
-        Mode::unavailable("dual-radio", "no radio supports AP mode".to_string())
-    } else {
-        Mode::available(
-            "dual-radio",
-            "uplinks over wifi, beacons on a second radio".to_string(),
-        )
+        ),
+        Some(_) if radios.len() < 2 => {
+            Mode::unavailable("dual-radio", "only one radio present".to_string())
+        }
+        Some(station) => match ap_radios.iter().find(|r| r.phy != station.phy) {
+            None => Mode::unavailable(
+                "dual-radio",
+                "the other radio cannot beacon (no AP mode)".to_string(),
+            ),
+            Some(ap_radio) => Mode::available(
+                "dual-radio",
+                format!(
+                    "uplink over {}, AP on {}",
+                    station
+                        .interfaces
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("?"),
+                    ap_radio
+                        .interfaces
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("?")
+                ),
+            ),
+        },
     };
     modes.push(dual);
 
@@ -360,16 +388,6 @@ pub fn derive_modes(radios: &[Radio], uplinks: &[Uplink], tools: Tools) -> Vec<M
         }
     };
     modes.push(wifi_uplink);
-
-    // bluetooth: paired phone with Bluetooth tethering
-    modes.push(if tools.bluetoothctl {
-        Mode::available(
-            "bluetooth",
-            "phone must be paired with Bluetooth tethering switched on".to_string(),
-        )
-    } else {
-        Mode::unavailable("bluetooth", "bluetoothctl not installed".to_string())
-    });
 
     // offline: no uplink; exercises the paywall and the panel
     modes.push(Mode::available(
@@ -627,7 +645,7 @@ fn classify_uplink(iface: &str) -> UplinkKind {
 }
 
 /// Interfaces currently holding the default IPv4 route, from /proc/net/route.
-fn default_route_ifaces() -> BTreeSet<String> {
+pub fn default_route_ifaces() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let Ok(text) = fs::read_to_string("/proc/net/route") else {
         return out;
@@ -723,15 +741,23 @@ mod tests {
         hostapd: true,
         dnsmasq: true,
         nft: true,
-        bluetoothctl: true,
     };
+
+    fn connected(mut r: Radio) -> Radio {
+        r.station = Some(Station {
+            connected: true,
+            ssid: Some("upstream".to_string()),
+            channel: Some(36),
+        });
+        r
+    }
 
     fn mode<'a>(modes: &'a [Mode], name: &str) -> &'a Mode {
         modes.iter().find(|m| m.name == name).unwrap()
     }
 
     #[test]
-    fn hotspot_needs_ap_radio_and_wired_uplink() {
+    fn hotspot_needs_ap_radio_and_uplink() {
         let radios = vec![radio(true, false)];
         let uplinks = vec![uplink(UplinkKind::UsbTether, true)];
         let modes = derive_modes(&radios, &uplinks, FULL_TOOLS);
@@ -742,41 +768,61 @@ mod tests {
 
     #[test]
     fn single_wifi_radio_cannot_hotspot_over_itself() {
-        let radios = vec![radio(true, false)];
-        let uplinks = vec![uplink(UplinkKind::Wifi, true)];
-        let modes = derive_modes(&radios, &uplinks, FULL_TOOLS);
+        let radios = vec![connected(radio(true, false))];
+        let modes = derive_modes(&radios, &[], FULL_TOOLS);
         assert!(!mode(&modes, "hotspot").available);
         assert!(mode(&modes, "hotspot").detail.contains("only radio"));
     }
 
     #[test]
-    fn two_radios_enable_hotspot_even_with_wifi_uplink_default() {
+    fn two_radios_enable_hotspot_and_dual_radio() {
         let mut second = radio(true, false);
         second.interfaces = vec!["wlan1".to_string()];
-        let radios = vec![radio(false, false), second];
-        let uplinks = vec![uplink(UplinkKind::Wifi, true)];
-        let modes = derive_modes(&radios, &uplinks, FULL_TOOLS);
-        // wifi uplink on wlan0, AP on wlan1: hotspot works via dual radios,
-        // and dual-radio mode itself is available.
+        second.phy = "phy1".to_string();
+        let radios = vec![connected(radio(true, false)), second];
+        let modes = derive_modes(&radios, &[], FULL_TOOLS);
+        assert!(mode(&modes, "hotspot").available);
         assert!(mode(&modes, "dual-radio").available);
+        assert!(mode(&modes, "dual-radio").detail.contains("uplink over"));
+    }
+
+    #[test]
+    fn dual_radio_needs_a_connected_station() {
+        let mut second = radio(true, false);
+        second.interfaces = vec!["wlan1".to_string()];
+        second.phy = "phy1".to_string();
+        let radios = vec![radio(true, false), second];
+        let modes = derive_modes(&radios, &[], FULL_TOOLS);
+        assert!(!mode(&modes, "dual-radio").available);
+        assert!(mode(&modes, "dual-radio").detail.contains("connect"));
+    }
+
+    #[test]
+    fn dual_radio_needs_an_ap_capable_second_radio() {
+        let mut second = radio(false, false);
+        second.interfaces = vec!["wlan1".to_string()];
+        second.phy = "phy1".to_string();
+        let radios = vec![connected(radio(true, false)), second];
+        let modes = derive_modes(&radios, &[], FULL_TOOLS);
+        assert!(!mode(&modes, "dual-radio").available);
+        assert!(mode(&modes, "dual-radio").detail.contains("AP mode"));
     }
 
     #[test]
     fn concurrent_radio_enables_wifi_uplink() {
-        let radios = vec![radio(true, true)];
-        let uplinks = vec![uplink(UplinkKind::Wifi, true)];
-        let modes = derive_modes(&radios, &uplinks, FULL_TOOLS);
+        let radios = vec![connected(radio(true, true))];
+        let modes = derive_modes(&radios, &[], FULL_TOOLS);
         assert!(mode(&modes, "wifi-uplink").available);
         assert!(mode(&modes, "wifi-uplink").detail.contains("channel"));
     }
 
     #[test]
-    fn missing_tools_block_all_ap_modes() {
+    fn missing_tools_block_ap_modes_but_not_offline() {
         let tools = Tools {
             hostapd: false,
             ..FULL_TOOLS
         };
-        let radios = vec![radio(true, true)];
+        let radios = vec![connected(radio(true, true))];
         let uplinks = vec![uplink(UplinkKind::Ethernet, true)];
         let modes = derive_modes(&radios, &uplinks, tools);
         assert!(!mode(&modes, "hotspot").available);
@@ -784,7 +830,7 @@ mod tests {
         assert!(!mode(&modes, "wifi-uplink").available);
         assert!(mode(&modes, "hotspot").detail.contains("hostapd"));
         assert!(mode(&modes, "offline").available);
-        assert!(mode(&modes, "bluetooth").available);
+        assert!(modes.iter().all(|m| m.name != "bluetooth"));
     }
 
     #[test]

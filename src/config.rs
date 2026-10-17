@@ -138,6 +138,9 @@ pub struct ApSettings {
     /// Force the hotspot onto this wifi interface (hosts with several
     /// radios). Unset: the first AP-capable radio is used.
     pub interface: Option<String>,
+    /// Force the internet-bound interface (hosts with several uplinks).
+    /// Unset: the interface holding the default route is used.
+    pub uplink: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -180,6 +183,7 @@ impl Default for ApSettings {
             ieee80211n: true,
             country_code: None,
             interface: None,
+            uplink: None,
         }
     }
 }
@@ -312,6 +316,19 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn ap_uplink_defaults_to_none() {
+        let cfg = Config::default();
+        assert!(cfg.ap.uplink.is_none());
+        assert!(cfg.ap.interface.is_none());
+    }
+
+    #[test]
+    fn ap_uplink_parses_from_json() {
+        let cfg: Config = serde_json::from_str(r#"{"ap":{"uplink":"wlan2"}}"#).unwrap();
+        assert_eq!(cfg.ap.uplink.as_deref(), Some("wlan2"));
     }
 
     #[test]

@@ -44,12 +44,16 @@ enum Command {
     /// Start the hotspot (root).
     Start {
         /// Bring up AP, DHCP, and paywall without an uplink — for tests.
-        #[arg(long, conflicts_with = "wifi_uplink")]
+        #[arg(long, conflicts_with_all = ["wifi_uplink", "dual_radio"])]
         offline: bool,
         /// Keep the wifi connection and beacon the AP beside it on a
         /// virtual interface (needs driver station+AP concurrency).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dual_radio")]
         wifi_uplink: bool,
+        /// Beacon the AP on a second radio while the first stays a
+        /// wifi station (two radios required).
+        #[arg(long)]
+        dual_radio: bool,
     },
     /// Stop the hotspot and restore the machine (root).
     Stop,
@@ -74,6 +78,8 @@ enum Command {
         offline: bool,
         #[arg(long)]
         wifi_uplink: bool,
+        #[arg(long)]
+        dual_radio: bool,
     },
 }
 
@@ -84,7 +90,8 @@ fn main() -> ExitCode {
         Command::Start {
             offline,
             wifi_uplink,
-        } => cmd_start(offline, wifi_uplink),
+            dual_radio,
+        } => cmd_start(offline, wifi_uplink, dual_radio),
         Command::Stop => cmd_stop(),
         Command::Status => cmd_status(),
         Command::List => cmd_list(),
@@ -96,9 +103,11 @@ fn main() -> ExitCode {
         Command::Daemon {
             offline,
             wifi_uplink,
+            dual_radio,
         } => daemon::run(daemon::Opts {
             offline,
             wifi_uplink,
+            dual_radio,
         }),
     };
     match result {
@@ -128,13 +137,14 @@ fn cmd_doctor(json: bool) -> CmdResult {
     Ok(())
 }
 
-fn cmd_start(offline: bool, wifi_uplink: bool) -> CmdResult {
+fn cmd_start(offline: bool, wifi_uplink: bool, dual_radio: bool) -> CmdResult {
     if !doctor::is_root() {
         return Err("start must run as root (try: sudo piso-hotspot start)".into());
     }
     daemon::spawn(daemon::Opts {
         offline,
         wifi_uplink,
+        dual_radio,
     })?;
     let status = control::request(&Request::Status).map_err(|e| e.to_string())?;
     if let Some(s) = status.status {
