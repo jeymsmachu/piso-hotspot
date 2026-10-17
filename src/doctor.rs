@@ -573,7 +573,7 @@ fn read_trimmed(path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn is_root() -> bool {
+pub fn is_root() -> bool {
     read_trimmed("/proc/self/status")
         .and_then(|status| {
             status.lines().find_map(|line| {

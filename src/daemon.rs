@@ -1,0 +1,665 @@
+//! The daemon: owns the radio, hostapd, dnsmasq, the paywall, and the
+//! control socket for as long as the hotspot runs.
+//!
+//! `piso-hotspot start` re-executes this binary as `daemon` (detached,
+//! setsid), waits until the control socket answers, and exits. Everything
+//! that must survive a closed terminal or terminal-less operation lives
+//! here.
+//!
+//! Ordering on bring-up is deliberate: the paywall table is installed
+//! *before* forwarding is enabled, and the gateway address exists before
+//! DHCP does — at no point does a client see working-but-ungated internet.
+
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::Ipv4Addr;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::{self, Config};
+use crate::control::{self, Request, Response, StatusInfo};
+use crate::doctor;
+use crate::nft::Firewall;
+use crate::paywall;
+use crate::radio;
+use crate::store;
+use crate::{leases, wireless};
+
+const PID_FILE: &str = "/run/piso-hotspot/daemon.pid";
+const LOG_FILE: &str = "/run/piso-hotspot/daemon.log";
+const RUNNING_FILE: &str = "/run/piso-hotspot/running.json";
+
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Set by signals and by "a child died"; the main loop watches it.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Which supervised process died first, if that is why we are shutting down.
+static CHILD_DEATH: Mutex<Option<String>> = Mutex::new(None);
+
+extern "C" fn on_signal(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Opts {
+    /// No uplink: exercise AP + DHCP + paywall without NAT.
+    pub offline: bool,
+}
+
+/// What `stop` needs if the daemon dies without cleaning up.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RunningRecord {
+    pub mode: String,
+    pub ap_iface: String,
+    pub uplink: Option<String>,
+    pub gateway: String,
+    /// `/proc/sys/net/ipv4/ip_forward` before we touched it.
+    pub ip_forward_prev: Option<String>,
+    pub started_at: i64,
+}
+
+// ------------------------------------------------------------- parent side
+
+/// Detach a daemon and wait until it answers on the control socket.
+pub fn spawn(opts: Opts) -> Result<(), String> {
+    if control::alive() {
+        return Err("piso-hotspot is already running (`piso-hotspot status`)".into());
+    }
+    // The daemon would normally create this; the log lives here too.
+    fs::create_dir_all("/run/piso-hotspot").map_err(|e| format!("cannot create run dir: {e}"))?;
+
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(LOG_FILE)
+        .map_err(|e| format!("cannot open {LOG_FILE}: {e}"))?;
+    let err_log = log.try_clone().map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon");
+    if opts.offline {
+        cmd.arg("--offline");
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err_log));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot spawn daemon: {e}"))?;
+
+    for _ in 0..75 {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "daemon exited during startup ({status}); log tail:\n{}",
+                log_tail()
+            ));
+        }
+        if control::alive() {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "daemon did not become ready in 15s; log tail:\n{}",
+        log_tail()
+    ))
+}
+
+fn log_tail() -> String {
+    let text = fs::read_to_string(LOG_FILE).unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(1500);
+    chars[start..].iter().collect()
+}
+
+/// Orderly shutdown, with emergency cleanup when the daemon cannot do
+/// it itself. Never touches interfaces it has no record of.
+pub fn stop() -> Result<(), String> {
+    if control::alive() {
+        control::request(&Request::Shutdown).map_err(|e| e.to_string())?;
+        for _ in 0..50 {
+            if !control::alive() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return Err("daemon accepted shutdown but is still answering after 10s".into());
+    }
+
+    // No live daemon: recover what a record says was started.
+    if let Some(pid) = read_pid() {
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        std::thread::sleep(Duration::from_millis(500));
+        cleanup_from_record();
+        return Err("daemon was not responding; cleaned up from the running record".into());
+    }
+
+    if Path::new(RUNNING_FILE).exists() {
+        cleanup_from_record();
+        println!("piso-hotspot: no daemon; cleaned up from the running record");
+        return Ok(());
+    }
+
+    // Nothing recorded: at most a stale paywall table (ours by name).
+    let stale_fw = Firewall {
+        ap_iface: String::new(),
+        uplink: None,
+        gateway: Ipv4Addr::UNSPECIFIED,
+    };
+    if stale_fw.table_exists() {
+        let _ = stale_fw.uninstall();
+        println!("piso-hotspot: removed a stale paywall table; interfaces untouched");
+    } else {
+        println!("piso-hotspot: not running");
+    }
+    Ok(())
+}
+
+fn read_pid() -> Option<u32> {
+    fs::read_to_string(PID_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+fn cleanup_from_record() {
+    let Ok(text) = fs::read_to_string(RUNNING_FILE) else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<RunningRecord>(&text) else {
+        return;
+    };
+    let fw = Firewall {
+        ap_iface: record.ap_iface.clone(),
+        uplink: record.uplink.clone(),
+        gateway: record.gateway.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
+    };
+    let _ = fw.uninstall();
+    let _ = radio::set_gateway(&record.ap_iface, &record.gateway, false);
+    if let Some(prev) = &record.ip_forward_prev
+        && let Ok(current) = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        && current.trim() != prev
+    {
+        let _ = radio::set_ip_forward(prev == "1");
+    }
+    radio::release(&record.ap_iface);
+    let _ = fs::remove_file(RUNNING_FILE);
+    let _ = fs::remove_file(PID_FILE);
+}
+
+// -------------------------------------------------------------- daemon side
+
+struct Daemon {
+    cfg: Config,
+    conn: rusqlite::Connection,
+    fw: Firewall,
+    mode: String,
+    started_at: i64,
+    ip_forward_prev: Option<String>,
+    hostapd: Option<Child>,
+    dnsmasq: Option<Child>,
+}
+
+/// Entry point for the hidden `daemon` subcommand.
+pub fn run(opts: Opts) -> ! {
+    if let Err(e) = run_inner(opts) {
+        // Never leave a stale pid file behind a failed start.
+        let _ = fs::remove_file(PID_FILE);
+        eprintln!("piso-hotspot daemon: {e}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+fn run_inner(opts: Opts) -> Result<(), String> {
+    fs::create_dir_all("/run/piso-hotspot").map_err(|e| e.to_string())?;
+    if !doctor::is_root() {
+        return Err("must run as root".into());
+    }
+
+    unsafe {
+        let handler = on_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+    fs::write(PID_FILE, format!("{}\n", std::process::id())).map_err(|e| e.to_string())?;
+
+    // Leftovers from a crashed previous run: finish their teardown first.
+    if !control::alive() && Path::new(RUNNING_FILE).exists() {
+        cleanup_from_record();
+    }
+
+    let cfg = Config::load(&config::config_path()).map_err(|e| e.to_string())?;
+    let conn = store::open(&config::state_path()).map_err(|e| e.to_string())?;
+
+    let plan = plan(opts, &cfg)?;
+    eprintln!(
+        "daemon: mode={} ap={} uplink={:?} gateway={}",
+        plan.mode, plan.ap_iface, plan.uplink, plan.gateway
+    );
+
+    let record = RunningRecord {
+        mode: plan.mode.clone(),
+        ap_iface: plan.ap_iface.clone(),
+        uplink: plan.uplink.clone(),
+        gateway: plan.gateway.to_string(),
+        ip_forward_prev: None,
+        started_at: now(),
+    };
+    fs::write(
+        RUNNING_FILE,
+        serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let fw = Firewall {
+        ap_iface: plan.ap_iface.clone(),
+        uplink: plan.uplink.clone(),
+        gateway: plan.gateway,
+    };
+
+    let mut daemon = Daemon {
+        cfg,
+        conn,
+        fw,
+        mode: plan.mode.clone(),
+        started_at: now(),
+        ip_forward_prev: None,
+        hostapd: None,
+        dnsmasq: None,
+    };
+
+    if let Err(e) = bring_up(&mut daemon, &plan) {
+        eprintln!("piso-hotspot daemon: bring-up failed: {e}");
+        teardown(&mut daemon);
+        return Err(e);
+    }
+    eprintln!("daemon: up");
+
+    let daemon = Arc::new(Mutex::new(daemon));
+    serve(Arc::clone(&daemon));
+    spawn_reconciler(Arc::clone(&daemon));
+    spawn_child_watch(Arc::clone(&daemon));
+
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let death = CHILD_DEATH.lock().ok().and_then(|d| d.clone());
+    let mut d = daemon.lock().map_err(|_| "state poisoned".to_string())?;
+    teardown(&mut d);
+    match death {
+        Some(what) => Err(format!("{what} died; hotspot shut down")),
+        None => Ok(()),
+    }
+}
+
+struct Plan {
+    mode: String,
+    ap_iface: String,
+    uplink: Option<String>,
+    gateway: Ipv4Addr,
+}
+
+/// Decide what to run from what doctor found. Pure inspection — no
+/// side effects before this returns.
+fn plan(opts: Opts, cfg: &Config) -> Result<Plan, String> {
+    let report = doctor::inspect();
+    let missing: Vec<String> = report
+        .dependencies
+        .iter()
+        .filter(|d| d.path.is_none() && d.name != "bluetoothctl")
+        .map(|d| d.name.clone())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("missing required tools: {}", missing.join(", ")));
+    }
+
+    let ap_radio = report
+        .radios
+        .iter()
+        .find(|r| r.supports_ap)
+        .ok_or("no wifi radio supports AP mode")?;
+    let ap_iface = ap_radio
+        .interfaces
+        .first()
+        .ok_or("AP-capable radio has no interface")?
+        .clone();
+
+    let gateway = cfg.gateway;
+    let uplink = if opts.offline {
+        None
+    } else {
+        let found = report
+            .uplinks
+            .iter()
+            .find(|u| u.is_default_route && u.kind != crate::doctor::UplinkKind::Wifi)
+            .map(|u| u.iface.clone());
+        match found {
+            Some(iface) => Some(iface),
+            None => {
+                return Err("no uplink: plug in a USB-tethered phone or ethernet cable \
+                     (or use `start --offline` to test without internet)"
+                    .into());
+            }
+        }
+    };
+
+    Ok(Plan {
+        mode: if opts.offline { "offline" } else { "hotspot" }.to_string(),
+        ap_iface,
+        uplink,
+        gateway,
+    })
+}
+
+fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
+    radio::take(&plan.ap_iface).map_err(|e| e.to_string())?;
+
+    // Paywall first: installed before forwarding exists.
+    d.fw.install()
+        .map_err(|e| format!("installing paywall: {e}"))?;
+
+    radio::set_gateway(&plan.ap_iface, &plan.gateway.to_string(), true)
+        .map_err(|e| format!("setting gateway address: {e}"))?;
+
+    d.ip_forward_prev =
+        Some(radio::set_ip_forward(true).map_err(|e| format!("enabling ip_forward: {e}"))?);
+    // Record the previous value for `stop` recovery.
+    if let Ok(text) = fs::read_to_string(RUNNING_FILE)
+        && let Ok(mut rec) = serde_json::from_str::<RunningRecord>(&text)
+    {
+        rec.ip_forward_prev = d.ip_forward_prev.clone();
+        if let Ok(text) = serde_json::to_string_pretty(&rec) {
+            let _ = fs::write(RUNNING_FILE, text);
+        }
+    }
+
+    fs::write(
+        wireless::DNSMASQ_CONF,
+        wireless::dnsmasq_config(&d.cfg, &plan.ap_iface),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(
+        wireless::HOSTAPD_CONF,
+        wireless::hostapd_config(&d.cfg, &plan.ap_iface),
+    )
+    .map_err(|e| e.to_string())?;
+
+    d.dnsmasq = Some(
+        supervise(
+            "dnsmasq",
+            &[
+                "--keep-in-foreground",
+                &format!("--conf-file={}", wireless::DNSMASQ_CONF),
+            ],
+        )
+        .map_err(|e| format!("starting dnsmasq: {e}"))?,
+    );
+    expect_alive(&mut d.dnsmasq, "dnsmasq")?;
+
+    d.hostapd = Some(
+        supervise("hostapd", &[wireless::HOSTAPD_CONF])
+            .map_err(|e| format!("starting hostapd: {e}"))?,
+    );
+    expect_alive(&mut d.hostapd, "hostapd")?;
+
+    // Everything is in place: bring the firewall in step with the store.
+    match paywall::reconcile(&d.conn, &d.fw, now()) {
+        Ok(r) if r.changed() => eprintln!("daemon: initial reconcile: {r:?}"),
+        Ok(_) => {}
+        Err(e) => eprintln!("daemon: initial reconcile failed: {e}"),
+    }
+    Ok(())
+}
+
+fn supervise(program: &str, args: &[&str]) -> std::io::Result<Child> {
+    Command::new(program).args(args).spawn()
+}
+
+fn expect_alive(child: &mut Option<Child>, name: &str) -> Result<(), String> {
+    std::thread::sleep(Duration::from_millis(400));
+    match child {
+        Some(c) => match c.try_wait() {
+            Ok(Some(status)) => Err(format!("{name} exited immediately: {status}")),
+            Ok(None) => Ok(()),
+            Err(e) => Err(format!("{name}: {e}")),
+        },
+        None => Err(format!("{name} not running")),
+    }
+}
+
+/// Kill children, disable forwarding, remove the paywall, hand the radio
+/// back. Every step tolerates "not done" so it doubles as the failure
+/// path. Order matters: stop the AP before the address, the address
+/// before handing the card to NetworkManager.
+fn teardown(d: &mut Daemon) {
+    for (child, name) in [(&mut d.hostapd, "hostapd"), (&mut d.dnsmasq, "dnsmasq")] {
+        if let Some(mut c) = child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            eprintln!("daemon: stopped {name}");
+        }
+    }
+    let _ = d.fw.uninstall();
+    let gateway = d.fw.gateway.to_string();
+    let _ = radio::set_gateway(&d.fw.ap_iface, &gateway, false);
+    if let Some(prev) = d.ip_forward_prev.take() {
+        let _ = radio::set_ip_forward(prev == "1");
+    }
+    radio::release(&d.fw.ap_iface);
+    for file in [
+        PID_FILE,
+        RUNNING_FILE,
+        control::SOCKET_PATH,
+        wireless::HOSTAPD_CONF,
+        wireless::DNSMASQ_CONF,
+        wireless::LEASE_FILE,
+    ] {
+        let _ = fs::remove_file(file);
+    }
+    eprintln!("daemon: teardown complete");
+}
+
+// --------------------------------------------------------------- serving
+
+fn serve(d: Arc<Mutex<Daemon>>) {
+    std::thread::spawn(move || {
+        let listener = match control::bind() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("daemon: control socket: {e}");
+                SHUTDOWN.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let d = Arc::clone(&d);
+            // Requests are cheap and rare; serial handling keeps the
+            // store single-writer without ceremony.
+            handle(&d, stream);
+        }
+    });
+}
+
+fn handle(d: &Arc<Mutex<Daemon>>, stream: std::os::unix::net::UnixStream) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    let response = match serde_json::from_str::<Request>(line.trim()) {
+        Err(e) => Response::err(format!("bad request: {e}")),
+        Ok(req) => dispatch(d, req),
+    };
+    let mut stream = reader.into_inner();
+    if let Ok(mut text) = serde_json::to_string(&response) {
+        text.push('\n');
+        let _ = stream.write_all(text.as_bytes());
+    }
+}
+
+fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
+    let result = (|| -> Result<Response, String> {
+        let d = d.lock().map_err(|_| "state poisoned".to_string())?;
+        match req {
+            Request::Status => {
+                let now_ts = now();
+                Ok(Response {
+                    ok: true,
+                    error: None,
+                    expires_at: None,
+                    status: Some(StatusInfo {
+                        mode: d.mode.clone(),
+                        ap_iface: d.fw.ap_iface.clone(),
+                        uplink: d.fw.uplink.clone(),
+                        gateway: d.fw.gateway.to_string(),
+                        started_at: d.started_at,
+                        devices_seen: store::count_devices(&d.conn).map_err(err_str)?,
+                        active_passes: store::count_active_passes(&d.conn, now_ts)
+                            .map_err(err_str)?,
+                    }),
+                })
+            }
+            Request::Grant { mac, pass } => {
+                let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
+                let pass = d
+                    .cfg
+                    .passes
+                    .iter()
+                    .find(|p| p.id == pass)
+                    .ok_or_else(|| {
+                        let ids: Vec<&str> = d.cfg.passes.iter().map(|p| p.id.as_str()).collect();
+                        format!("unknown pass {:?}; configured: {}", pass, ids.join(", "))
+                    })?
+                    .clone();
+                let now_ts = now();
+                let expires =
+                    store::grant(&d.conn, &mac, &pass, now_ts, &d.cfg.currency).map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now_ts).map_err(err_str)?;
+                Ok(Response {
+                    ok: true,
+                    error: None,
+                    status: None,
+                    expires_at: Some(expires),
+                })
+            }
+            Request::Revoke { mac } => {
+                let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
+                store::revoke(&d.conn, &mac, now()).map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                Ok(Response::ok_empty())
+            }
+            Request::Friend { mac, label } => {
+                let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
+                store::friend(&d.conn, &mac, label.as_deref(), now()).map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                Ok(Response::ok_empty())
+            }
+            Request::Unfriend { mac } => {
+                let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
+                store::unfriend(&d.conn, &mac).map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                Ok(Response::ok_empty())
+            }
+            Request::Shutdown => {
+                SHUTDOWN.store(true, Ordering::SeqCst);
+                Ok(Response::ok_empty())
+            }
+        }
+    })();
+    match result {
+        Ok(resp) => resp,
+        Err(e) => Response::err(e),
+    }
+}
+
+fn err_str(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+/// The loop that keeps the kernel honest: expire passes, sync sets,
+/// notice new devices via our own DHCP leases.
+fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
+    std::thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(RECONCILE_INTERVAL);
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            let Ok(d) = d.lock() else { return };
+            let now_ts = now();
+            match paywall::reconcile(&d.conn, &d.fw, now_ts) {
+                Ok(r) if r.changed() => eprintln!("reconcile: {r:?}"),
+                Ok(_) => {}
+                Err(e) => eprintln!("reconcile failed: {e}"),
+            }
+            for lease in leases::read(Path::new(wireless::LEASE_FILE)) {
+                if let Err(e) = store::touch_leased_device(&d.conn, &lease.mac, now_ts) {
+                    eprintln!("lease touch failed: {e}");
+                }
+            }
+        }
+    });
+}
+
+/// If hostapd or dnsmasq dies, the hotspot is a lie — shut down.
+fn spawn_child_watch(d: Arc<Mutex<Daemon>>) {
+    std::thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut death: Option<String> = None;
+            {
+                let Ok(mut guard) = d.lock() else { return };
+                if let Some(status) = guard
+                    .hostapd
+                    .as_mut()
+                    .and_then(|c| c.try_wait().ok().flatten())
+                {
+                    death = Some(format!("hostapd ({status})"));
+                } else if let Some(status) = guard
+                    .dnsmasq
+                    .as_mut()
+                    .and_then(|c| c.try_wait().ok().flatten())
+                {
+                    death = Some(format!("dnsmasq ({status})"));
+                }
+            }
+            if let Some(what) = death {
+                if SHUTDOWN.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Ok(mut slot) = CHILD_DEATH.lock() {
+                    *slot = Some(what);
+                }
+                SHUTDOWN.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    });
+}

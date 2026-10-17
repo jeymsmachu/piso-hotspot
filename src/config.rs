@@ -82,6 +82,9 @@ pub struct ApSettings {
     pub isolate_clients: bool,
     /// Ask for 802.11n rates so the radio is not the bottleneck.
     pub ieee80211n: bool,
+    /// Regulatory domain advertised to clients, e.g. `"PH"`. Omitted
+    /// from hostapd config when unset (the kernel's default applies).
+    pub country_code: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,6 +117,7 @@ impl Default for ApSettings {
             port: 8080,
             isolate_clients: true,
             ieee80211n: true,
+            country_code: None,
         }
     }
 }
@@ -178,6 +182,13 @@ impl Config {
             || self.gateway.is_unspecified()
         {
             problems.push(format!("gateway {} is not a usable address", self.gateway));
+        }
+        if let Some(country) = &self.ap.country_code
+            && !(country.len() == 2 && country.bytes().all(|b| b.is_ascii_uppercase()))
+        {
+            problems.push(format!(
+                "ap.country_code must be a 2-letter ISO code like \"PH\", got {country:?}"
+            ));
         }
         if self.passes.is_empty() {
             problems.push("at least one pass must be configured".to_string());

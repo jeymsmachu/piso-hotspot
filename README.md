@@ -10,14 +10,20 @@ concurrency — the same wifi card that carries the internet.
 
 ## Status
 
-Early development. The only command today is `doctor` (below); the hotspot
-itself, the paywall, and the admin panel are being rebuilt here.
+Early development. `doctor` inspects the machine; `start`/`stop` run the
+hotspot with the paywall (sell passes from the command line). The admin
+panel and captive portal are not built yet.
+
+**While the hotspot runs, the wifi radio is spent on the access point** —
+the machine itself stops scanning and its own wifi connections drop.
+`piso-hotspot stop` hands the radio back to NetworkManager.
 
 ## Requirements
 
 - Linux with `iw`, `hostapd`, `dnsmasq`, and `nft` (nftables) installed
 - A wifi radio that supports AP mode (`piso-hotspot doctor` tells you)
-- Root, for starting the hotspot (not needed for `doctor`)
+- An uplink to share: a USB-tethered phone or an ethernet cable
+- Root for `start`/`stop` (not needed for `doctor`, `list`, `friends`)
 
 ## `piso-hotspot doctor`
 
@@ -78,6 +84,40 @@ combination (`iw list` → "valid interface combinations"). Most stock laptop
 cards do not; some Realtek cards do after a driver patch, and some cards
 advertise it out of the box. The doctor reads what the kernel actually
 offers — it does not care which driver or patch produced it.
+
+## Running the hotspot
+
+```bash
+sudo piso-hotspot start          # AP + DHCP + paywall; shares the default-route uplink
+sudo piso-hotspot start --offline  # no uplink: test the paywall without internet
+sudo piso-hotspot stop           # tear everything down, hand the wifi card back
+```
+
+`start` refuses before touching anything when no uplink is available. The
+daemon it spawns survives a closed terminal; the paywall table is installed
+*before* forwarding is enabled, so no client ever sees ungated internet.
+
+Selling passes, from the laptop:
+
+```bash
+sudo piso-hotspot grant 1c:ce:51:a2:ff:9f quick     # ₱3, 15 minutes
+sudo piso-hotspot grant 1c:ce:51:a2:ff:9f extended  # ₱5, 45 minutes
+sudo piso-hotspot grant 1c:ce:51:a2:ff:9f day       # ₱15, until midnight
+sudo piso-hotspot revoke 1c:ce:51:a2:ff:9f          # cut them off
+sudo piso-hotspot friend 1c:ce:51:a2:ff:9f "Sir Tony"  # unlimited, free
+sudo piso-hotspot unfriend 1c:ce:51:a2:ff:9f
+piso-hotspot status              # is it running? (needs root: socket is 0600)
+piso-hotspot list                # devices seen, pass state, expiry
+piso-hotspot friends             # friend list
+```
+
+Clients are keyed by MAC: connecting to the wifi is not enough — only
+`grant`ed (or friend) MACs pass the firewall, and `revoke` takes effect on
+the next packet even for connections already open.
+
+Configuration lives in `/etc/piso-hotspot/config.json` (all fields optional;
+`piso-hotspot doctor` shows whether yours exists). Pass prices, SSID,
+passphrase, gateway, channel, and client limits are all there.
 
 ## Development
 

@@ -15,16 +15,6 @@ pub enum MacError {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MacAddr([u8; 6]);
 
-impl MacAddr {
-    pub const fn new(bytes: [u8; 6]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn bytes(&self) -> [u8; 6] {
-        self.0
-    }
-}
-
 impl FromStr for MacAddr {
     type Err = MacError;
 
