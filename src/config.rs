@@ -361,6 +361,16 @@ mod tests {
     }
 
     #[test]
+    fn documented_example_config_parses_and_validates() {
+        // docs/config.example.json is the reference operators copy;
+        // it must never drift from the real schema or defaults.
+        let cfg: Config =
+            serde_json::from_str(include_str!("../docs/config.example.json")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
     fn ap_uplink_defaults_to_none() {
         let cfg = Config::default();
         assert!(cfg.ap.uplink.is_none());

@@ -1,0 +1,30 @@
+[Unit]
+Description=piso-hotspot pay-per-usage wifi hotspot
+Documentation=file:///etc/piso-hotspot/config.json
+# The daemon supervises hostapd/dnsmasq and owns firewall state; it
+# must never be restarted while the previous teardown is incomplete.
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+# Never stop on suspend: a suspended host silently stops enforcing the
+# paywall for every associated client.
+RefuseManualStop=no
+
+[Service]
+Type=forking
+# `start` forks the daemon, waits for it to answer on the control
+# socket, and exits — exactly what Type=forking expects.
+ExecStart=/usr/bin/piso-hotspot start
+ExecStop=/usr/bin/piso-hotspot stop
+PIDFile=/run/piso-hotspot/daemon.pid
+# Teardown must finish even if the supervisor gives up waiting.
+TimeoutStopSec=45
+Restart=no
+# The daemon needs the network stack, not much else.
+PrivateTmp=yes
+ProtectHome=yes
+# It writes /run/piso-hotspot, /etc/piso-hotspot/state.db, and firewall
+# state; protect the rest of the filesystem but not those paths.
+ReadWritePaths=/run/piso-hotspot /etc/piso-hotspot
+
+[Install]
+WantedBy=multi-user.target

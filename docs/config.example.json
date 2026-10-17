@@ -1,0 +1,48 @@
+{
+  "ap": {
+    "ssid": "piso-hotspot",
+    "passphrase": "",
+    "channel": 6,
+    "max_clients": 12,
+    "port": 8080,
+    "isolate_clients": true,
+    "ieee80211n": true,
+    "country_code": null,
+    "interface": null,
+    "uplink": null
+  },
+
+  "gateway": "10.10.0.1",
+  "currency": "PHP",
+
+  "passes": [
+    { "id": "quick",    "name": "Quick",    "price_minor": 300,  "duration_secs": 900 },
+    { "id": "extended", "name": "Extended", "price_minor": 500,  "duration_secs": 2700 },
+    { "id": "day",      "name": "Day",      "price_minor": 1500, "duration_secs": null }
+  ],
+
+  "blocked_page": {
+    "title": "No internet yet",
+    "message": "See the operator to buy a pass.",
+    "footer": "",
+    "payment_instructions": "",
+    "show_prices": true
+  },
+
+  "admin": {
+    "passphrase": ""
+  },
+
+  "portal": {
+    "enabled": true
+  },
+
+  "ui": {
+    "theme": "auto"
+  },
+
+  "bandwidth": {
+    "max_down_bytes_per_sec": null,
+    "max_up_bytes_per_sec": null
+  }
+}
