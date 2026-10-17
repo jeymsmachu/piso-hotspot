@@ -57,6 +57,9 @@ pub fn now() -> i64 {
 pub struct Opts {
     /// No uplink: exercise AP + DHCP + paywall without NAT.
     pub offline: bool,
+    /// Keep the station associated and beacon the AP beside it on a
+    /// virtual interface (needs driver station+AP concurrency).
+    pub wifi_uplink: bool,
 }
 
 /// What `stop` needs if the daemon dies without cleaning up.
@@ -94,6 +97,9 @@ pub fn spawn(opts: Opts) -> Result<(), String> {
     cmd.arg("daemon");
     if opts.offline {
         cmd.arg("--offline");
+    }
+    if opts.wifi_uplink {
+        cmd.arg("--wifi-uplink");
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -205,7 +211,12 @@ fn cleanup_from_record() {
     {
         let _ = radio::set_ip_forward(prev == "1");
     }
-    radio::release(&record.ap_iface);
+    if record.mode == "wifi-uplink" {
+        // The station was never ours to touch; only remove the virtual AP.
+        crate::viface::remove(&record.ap_iface);
+    } else {
+        radio::release(&record.ap_iface);
+    }
     let _ = fs::remove_file(RUNNING_FILE);
     let _ = fs::remove_file(PID_FILE);
 }
@@ -323,11 +334,17 @@ struct Plan {
     ap_iface: String,
     uplink: Option<String>,
     gateway: Ipv4Addr,
+    /// Channel the AP must use because the radio has no channel of its
+    /// own to give (`--wifi-uplink`: the station's current channel).
+    station_channel: Option<u8>,
 }
 
 /// Decide what to run from what doctor found. Pure inspection — no
 /// side effects before this returns.
 fn plan(opts: Opts, cfg: &Config) -> Result<Plan, String> {
+    if opts.offline && opts.wifi_uplink {
+        return Err("--offline and --wifi-uplink are mutually exclusive".into());
+    }
     let report = doctor::inspect();
     let missing: Vec<String> = report
         .dependencies
@@ -337,6 +354,10 @@ fn plan(opts: Opts, cfg: &Config) -> Result<Plan, String> {
         .collect();
     if !missing.is_empty() {
         return Err(format!("missing required tools: {}", missing.join(", ")));
+    }
+
+    if opts.wifi_uplink {
+        return wifi_uplink_plan(&report, cfg);
     }
 
     let ap_radio = report
@@ -374,11 +395,51 @@ fn plan(opts: Opts, cfg: &Config) -> Result<Plan, String> {
         ap_iface,
         uplink,
         gateway,
+        station_channel: None,
+    })
+}
+
+/// `--wifi-uplink`: the radio stays associated with the operator's
+/// network and beacons the hotspot beside it — but only if the driver
+/// advertises station+AP concurrency *and* the station side is
+/// actually connected, because there the uplink is the association.
+fn wifi_uplink_plan(report: &doctor::Report, cfg: &Config) -> Result<Plan, String> {
+    let radio = report.radios.iter().find(|r| r.concurrent_ap_sta).ok_or(
+        "no radio advertises station+AP interface combinations; \
+         `piso-hotspot doctor` shows what the driver supports \
+         (some cards need a driver patch)",
+    )?;
+    let station_iface = radio
+        .interfaces
+        .first()
+        .ok_or("the concurrent-capable radio has no interface")?
+        .clone();
+    let station = radio.station.as_ref().filter(|s| s.connected).ok_or(
+        "wifi-uplink needs the station side connected first — its wifi \
+         connection is what the hotspot sells (connect, then start again)",
+    )?;
+    let channel = station
+        .channel
+        .ok_or("could not read the station's channel; is the connection stable?")?;
+
+    Ok(Plan {
+        mode: "wifi-uplink".to_string(),
+        ap_iface: crate::viface::AP_IFACE.to_string(),
+        uplink: Some(station_iface),
+        gateway: cfg.gateway,
+        station_channel: Some(channel),
     })
 }
 
 fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
-    radio::take(&plan.ap_iface).map_err(|e| e.to_string())?;
+    if plan.mode == "wifi-uplink" {
+        // The station keeps its association and NetworkManager keeps
+        // the device; the AP lives on a virtual interface beside it.
+        crate::viface::create(&plan.uplink.clone().unwrap_or_default())
+            .map_err(|e| format!("creating the virtual AP interface: {e}"))?;
+    } else {
+        radio::take(&plan.ap_iface).map_err(|e| e.to_string())?;
+    }
 
     // Paywall first: installed before forwarding exists.
     d.fw.install()
@@ -406,7 +467,11 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     fs::write(
         wireless::HOSTAPD_CONF,
-        wireless::hostapd_config(&d.cfg, &plan.ap_iface),
+        wireless::hostapd_config_on_channel(
+            &d.cfg,
+            &plan.ap_iface,
+            plan.station_channel.unwrap_or(d.cfg.ap.channel),
+        ),
     )
     .map_err(|e| e.to_string())?;
 
@@ -471,7 +536,13 @@ fn teardown(d: &mut Daemon) {
     if let Some(prev) = d.ip_forward_prev.take() {
         let _ = radio::set_ip_forward(prev == "1");
     }
-    radio::release(&d.fw.ap_iface);
+    if d.mode == "wifi-uplink" {
+        // The station and NetworkManager were never touched; only the
+        // virtual AP interface goes away.
+        crate::viface::remove(&d.fw.ap_iface);
+    } else {
+        radio::release(&d.fw.ap_iface);
+    }
     for file in [
         PID_FILE,
         RUNNING_FILE,

@@ -12,17 +12,18 @@ pub const HOSTAPD_CONF: &str = "/run/piso-hotspot/hostapd.conf";
 pub const DNSMASQ_CONF: &str = "/run/piso-hotspot/dnsmasq.conf";
 pub const LEASE_FILE: &str = "/run/piso-hotspot/dnsmasq.leases";
 
-/// hostapd configuration for the given interface.
+/// hostapd configuration for the given interface on an explicit channel.
 ///
 /// Channel 1–14 is 2.4 GHz (`hw_mode=g`); anything above is 5/6 GHz
-/// (`hw_mode=a`).
-pub fn hostapd_config(cfg: &Config, iface: &str) -> String {
+/// (`hw_mode=a`). Callers pass the configured channel, or — in
+/// `--wifi-uplink` — the station's current channel, which the single
+/// radio cannot deviate from.
+pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> String {
     let mut out = format!(
         "interface={iface}\ndriver=nl80211\nssid={ssid}\nchannel={channel}\n",
         ssid = cfg.ap.ssid,
-        channel = cfg.ap.channel,
     );
-    out.push_str(if cfg.ap.channel <= 14 {
+    out.push_str(if channel <= 14 {
         "hw_mode=g\n"
     } else {
         "hw_mode=a\n"
@@ -82,6 +83,11 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    /// The configured-channel form hotspot mode uses.
+    fn hostapd_config(cfg: &Config, iface: &str) -> String {
+        hostapd_config_on_channel(cfg, iface, cfg.ap.channel)
     }
 
     #[test]
@@ -163,5 +169,22 @@ mod tests {
         let out = dnsmasq_config(&cfg(), "wlan0");
         assert!(out.starts_with("conf-file=/dev/null"));
         assert!(out.contains("server=1.1.1.1"));
+    }
+
+    #[test]
+    fn wifi_uplink_follows_station_channel_and_band() {
+        // Station on 5 GHz channel 149: the AP must beacon there too,
+        // whatever the operator's configured channel says (this config
+        // has channel 6).
+        let c = cfg();
+        assert_eq!(c.ap.channel, 6);
+        let out = hostapd_config_on_channel(&c, "ap0", 149);
+        assert!(out.contains("channel=149"));
+        assert!(out.contains("hw_mode=a"));
+        assert!(out.contains("interface=ap0"));
+
+        let out = hostapd_config_on_channel(&c, "ap0", 1);
+        assert!(out.contains("channel=1"));
+        assert!(out.contains("hw_mode=g"));
     }
 }

@@ -77,8 +77,10 @@ impl Firewall {
         iifname != \"{ap}\" accept
         # Friends and paying clients may pass; everyone else is dropped,
         # existing connections included: revoke means no internet.
-        ether saddr @{SET_FRIENDS} accept
-        ether saddr @{SET_ALLOWED} accept
+        # Counters on the accept rules give the operator a live view of
+        # whether granted clients are actually flowing.
+        ether saddr @{SET_FRIENDS} counter accept
+        ether saddr @{SET_ALLOWED} counter accept
         counter drop
     }}
 
@@ -248,8 +250,11 @@ mod tests {
     fn render_gates_the_ap_interface_only() {
         let rules = fw(None).render();
         assert!(rules.contains("iifname != \"wlan0\" accept"));
-        assert!(rules.contains("ether saddr @allowed accept"));
+        assert!(rules.contains("ether saddr @allowed counter accept"));
         assert!(rules.contains("counter drop"));
+        // Every policy decision is observable: both accepts, the
+        // forward drop, and the input drop all carry counters.
+        assert_eq!(rules.matches("counter").count(), 4);
     }
 
     #[test]

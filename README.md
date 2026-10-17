@@ -88,14 +88,30 @@ offers — it does not care which driver or patch produced it.
 ## Running the hotspot
 
 ```bash
-sudo piso-hotspot start          # AP + DHCP + paywall; shares the default-route uplink
-sudo piso-hotspot start --offline  # no uplink: test the paywall without internet
-sudo piso-hotspot stop           # tear everything down, hand the wifi card back
+sudo piso-hotspot start              # AP + DHCP + paywall; shares the default-route uplink
+sudo piso-hotspot start --wifi-uplink  # keeps your wifi connected; AP rides beside it
+sudo piso-hotspot start --offline    # no uplink: test the paywall without internet
+sudo piso-hotspot stop             # tear everything down, hand the wifi card back
 ```
 
 `start` refuses before touching anything when no uplink is available. The
 daemon it spawns survives a closed terminal; the paywall table is installed
 *before* forwarding is enabled, so no client ever sees ungated internet.
+
+### wifi-uplink: sell the connection you already have
+
+`--wifi-uplink` beacons the hotspot on a **virtual interface while your
+wifi stays connected** — one card, two jobs, no disconnecting anything.
+Your laptop keeps browsing through the same association the students pay
+for.
+
+- Needs the driver to advertise station+AP concurrency; `piso-hotspot
+  doctor` says whether yours does (some cards need a driver patch).
+- The AP **follows your wifi's channel and band** — connect to 2.4 GHz if
+  your students' devices are old.
+- Throughput is shared with your own connection; expect roughly half.
+- Your wifi must be connected *before* you start — there the uplink is
+  the association itself.
 
 Selling passes, from the laptop:
 

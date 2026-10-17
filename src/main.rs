@@ -12,6 +12,7 @@ mod passes;
 mod paywall;
 mod radio;
 mod store;
+mod viface;
 mod wireless;
 
 use std::process::ExitCode;
@@ -38,8 +39,12 @@ enum Command {
     /// Start the hotspot (root).
     Start {
         /// Bring up AP, DHCP, and paywall without an uplink — for tests.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wifi_uplink")]
         offline: bool,
+        /// Keep the wifi connection and beacon the AP beside it on a
+        /// virtual interface (needs driver station+AP concurrency).
+        #[arg(long)]
+        wifi_uplink: bool,
     },
     /// Stop the hotspot and restore the machine (root).
     Stop,
@@ -62,6 +67,8 @@ enum Command {
     Daemon {
         #[arg(long)]
         offline: bool,
+        #[arg(long)]
+        wifi_uplink: bool,
     },
 }
 
@@ -69,7 +76,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Doctor { json } => cmd_doctor(json),
-        Command::Start { offline } => cmd_start(offline),
+        Command::Start {
+            offline,
+            wifi_uplink,
+        } => cmd_start(offline, wifi_uplink),
         Command::Stop => cmd_stop(),
         Command::Status => cmd_status(),
         Command::List => cmd_list(),
@@ -78,7 +88,13 @@ fn main() -> ExitCode {
         Command::Revoke { mac } => cmd_revoke(mac),
         Command::Friend { mac, label } => cmd_friend(mac, label),
         Command::Unfriend { mac } => cmd_unfriend(mac),
-        Command::Daemon { offline } => daemon::run(daemon::Opts { offline }),
+        Command::Daemon {
+            offline,
+            wifi_uplink,
+        } => daemon::run(daemon::Opts {
+            offline,
+            wifi_uplink,
+        }),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -107,11 +123,14 @@ fn cmd_doctor(json: bool) -> CmdResult {
     Ok(())
 }
 
-fn cmd_start(offline: bool) -> CmdResult {
+fn cmd_start(offline: bool, wifi_uplink: bool) -> CmdResult {
     if !doctor::is_root() {
         return Err("start must run as root (try: sudo piso-hotspot start)".into());
     }
-    daemon::spawn(daemon::Opts { offline })?;
+    daemon::spawn(daemon::Opts {
+        offline,
+        wifi_uplink,
+    })?;
     let status = control::request(&Request::Status).map_err(|e| e.to_string())?;
     if let Some(s) = status.status {
         println!("piso-hotspot is running");
