@@ -50,6 +50,11 @@ pub struct Firewall {
     pub uplink: Option<String>,
     /// Gateway address; clients sit in its /24.
     pub gateway: Ipv4Addr,
+    /// Admin panel port, open to clients and uplink alike. `0` means
+    /// "not configured" and stays closed (fail closed).
+    pub panel_port: u16,
+    /// Serve the captive portal on port 80 to clients.
+    pub portal_enabled: bool,
 }
 
 impl Firewall {
@@ -62,6 +67,23 @@ impl Firewall {
     /// Render the complete table for `nft -f -`.
     pub fn render(&self) -> String {
         let ap = validate_iface(&self.ap_iface).expect("validated at construction");
+        // Web ports for hotspot clients: the captive portal (80) and the
+        // admin panel. Port 0 means "not configured" and stays closed.
+        let mut web_ports: Vec<u16> = Vec::new();
+        if self.portal_enabled {
+            web_ports.push(80);
+        }
+        if self.panel_port != 0 && self.panel_port != 80 {
+            web_ports.push(self.panel_port);
+        }
+        let web_rule = match web_ports.len() {
+            0 => String::new(),
+            1 => format!("        tcp dport {} accept\n", web_ports[0]),
+            _ => {
+                let list: Vec<String> = web_ports.iter().map(|p| p.to_string()).collect();
+                format!("        tcp dport {{ {} }} accept\n", list.join(", "))
+            }
+        };
         let mut out = format!(
             "table inet {TABLE} {{
     set {SET_ALLOWED} {{
@@ -94,7 +116,7 @@ impl Firewall {
         udp dport {{ 67, 53 }} accept
         tcp dport 53 accept
         icmp type echo-request accept
-        counter drop
+{web_rule}        counter drop
     }}
 "
         );
@@ -239,6 +261,8 @@ mod tests {
             ap_iface: "wlan0".to_string(),
             uplink: uplink.map(str::to_string),
             gateway: Ipv4Addr::new(10, 10, 0, 1),
+            panel_port: 8080,
+            portal_enabled: true,
         }
     }
 
@@ -255,6 +279,49 @@ mod tests {
         // Every policy decision is observable: both accepts, the
         // forward drop, and the input drop all carry counters.
         assert_eq!(rules.matches("counter").count(), 4);
+    }
+
+    #[test]
+    fn portal_and_panel_ports_open_to_clients() {
+        let rules = fw(None).render();
+        assert!(rules.contains("tcp dport { 80, 8080 } accept"), "{rules}");
+    }
+
+    #[test]
+    fn portal_disabled_leaves_only_the_panel() {
+        let mut f = fw(None);
+        f.portal_enabled = false;
+        let rules = f.render();
+        let input = rules.split("chain input").nth(1).expect("input chain");
+        assert!(input.contains("tcp dport 8080 accept"), "{input}");
+        assert!(!input.contains("dport { 80"), "no web port list: {input}");
+        assert!(!input.contains("tcp dport 80 "), "no bare 80: {input}");
+    }
+
+    #[test]
+    fn unconfigured_panel_port_stays_closed() {
+        let mut f = fw(None);
+        f.panel_port = 0;
+        f.portal_enabled = false;
+        let rules = f.render();
+        let input = rules.split("chain input").nth(1).expect("input chain");
+        // DHCP/DNS legitimately keep their ports; no *web* port may open.
+        assert!(!input.contains("dport 80"), "fail closed: {input}");
+        // With the portal on, port 80 still opens for clients.
+        f.portal_enabled = true;
+        let rules = f.render();
+        let input = rules.split("chain input").nth(1).expect("input chain");
+        assert!(input.contains("tcp dport 80 accept"), "{input}");
+    }
+
+    #[test]
+    fn panel_on_port_80_is_not_duplicated() {
+        let mut f = fw(None);
+        f.panel_port = 80;
+        let rules = f.render();
+        let input = rules.split("chain input").nth(1).expect("input chain");
+        assert!(input.contains("tcp dport 80 accept"), "{input}");
+        assert!(!input.contains("{ 80"), "80 must appear once: {input}");
     }
 
     #[test]
@@ -298,6 +365,8 @@ mod tests {
             ap_iface: "wlan0".into(),
             uplink: Some("usb0".into()),
             gateway: Ipv4Addr::new(10, 10, 0, 1),
+            panel_port: 8080,
+            portal_enabled: true,
         };
         assert!(fw.render().contains("table inet piso"));
     }

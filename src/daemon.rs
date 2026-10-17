@@ -175,6 +175,8 @@ pub fn stop() -> Result<(), String> {
         ap_iface: String::new(),
         uplink: None,
         gateway: Ipv4Addr::UNSPECIFIED,
+        panel_port: 0,
+        portal_enabled: false,
     };
     if stale_fw.table_exists() {
         let _ = stale_fw.uninstall();
@@ -202,6 +204,9 @@ fn cleanup_from_record() {
         ap_iface: record.ap_iface.clone(),
         uplink: record.uplink.clone(),
         gateway: record.gateway.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
+        // Uninstall never renders; ports are irrelevant here.
+        panel_port: 0,
+        portal_enabled: false,
     };
     let _ = fw.uninstall();
     let _ = radio::set_gateway(&record.ap_iface, &record.gateway, false);
@@ -223,12 +228,21 @@ fn cleanup_from_record() {
 
 // -------------------------------------------------------------- daemon side
 
-struct Daemon {
-    cfg: Config,
-    conn: rusqlite::Connection,
-    fw: Firewall,
-    mode: String,
-    started_at: i64,
+/// Shared between the control socket, reconciler, child watcher, and
+/// the HTTP panel. Fields are `pub(crate)` because the panel handlers
+/// read them; the mutex keeps every access serialized.
+pub(crate) struct Daemon {
+    pub(crate) cfg: Config,
+    pub(crate) conn: rusqlite::Connection,
+    pub(crate) fw: Firewall,
+    pub(crate) mode: String,
+    pub(crate) started_at: i64,
+    /// Panel login state (sessions, lockout, effective passphrase).
+    pub(crate) auth: crate::auth::AuthState,
+    /// URLs the panel answers on, computed once after bring-up.
+    pub(crate) panel_urls: Vec<String>,
+    /// True when the passphrase was generated (not from config).
+    pub(crate) passphrase_generated: bool,
     ip_forward_prev: Option<String>,
     hostapd: Option<Child>,
     dnsmasq: Option<Child>,
@@ -247,6 +261,12 @@ pub fn run(opts: Opts) -> ! {
 
 fn run_inner(opts: Opts) -> Result<(), String> {
     fs::create_dir_all("/run/piso-hotspot").map_err(|e| e.to_string())?;
+    // Root-only from here: the daemon log and run files may hold
+    // operational detail, the control socket holds power.
+    let _ = fs::set_permissions(
+        "/run/piso-hotspot",
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    );
     if !doctor::is_root() {
         return Err("must run as root".into());
     }
@@ -291,6 +311,14 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         ap_iface: plan.ap_iface.clone(),
         uplink: plan.uplink.clone(),
         gateway: plan.gateway,
+        panel_port: cfg.ap.port,
+        portal_enabled: cfg.portal.enabled,
+    };
+
+    let (passphrase, passphrase_generated) = if cfg.admin.passphrase.is_empty() {
+        (crate::auth::new_passphrase(), true)
+    } else {
+        (cfg.admin.passphrase.clone(), false)
     };
 
     let mut daemon = Daemon {
@@ -299,6 +327,9 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         fw,
         mode: plan.mode.clone(),
         started_at: now(),
+        auth: crate::auth::AuthState::new(passphrase),
+        panel_urls: Vec::new(),
+        passphrase_generated,
         ip_forward_prev: None,
         hostapd: None,
         dnsmasq: None,
@@ -309,12 +340,27 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         teardown(&mut daemon);
         return Err(e);
     }
-    eprintln!("daemon: up");
+    daemon.panel_urls = panel_urls(
+        daemon.fw.gateway,
+        daemon.cfg.ap.port,
+        daemon.fw.uplink.as_deref(),
+    );
+    eprintln!("daemon: up; panel: {:?}", daemon.panel_urls);
 
+    let port = daemon.cfg.ap.port;
     let daemon = Arc::new(Mutex::new(daemon));
     serve(Arc::clone(&daemon));
     spawn_reconciler(Arc::clone(&daemon));
     spawn_child_watch(Arc::clone(&daemon));
+    {
+        let panel_state = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            if let Err(e) = crate::http::spawn_panel(panel_state, port) {
+                // The paywall and CLI keep working without the panel.
+                eprintln!("piso-hotspot daemon: panel unavailable: {e}");
+            }
+        });
+    }
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(250));
@@ -337,6 +383,35 @@ struct Plan {
     /// Channel the AP must use because the radio has no channel of its
     /// own to give (`--wifi-uplink`: the station's current channel).
     station_channel: Option<u8>,
+}
+
+/// Every address the panel answers on: localhost, the AP gateway, and
+/// the uplink side (so a tethered phone or a LAN device can reach it).
+fn panel_urls(gateway: Ipv4Addr, port: u16, uplink: Option<&str>) -> Vec<String> {
+    let mut urls = vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://{gateway}:{port}"),
+    ];
+    if let Some(iface) = uplink
+        && let Some(ip) = iface_ipv4(iface)
+    {
+        urls.push(format!("http://{ip}:{port}"));
+    }
+    urls
+}
+
+/// First IPv4 address of an interface, from `ip -o -4 addr show`.
+fn iface_ipv4(iface: &str) -> Option<String> {
+    let out = Command::new("ip")
+        .args(["-o", "-4", "addr", "show", "dev", iface])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "3: wlan0    inet 192.168.100.176/24 brd ..."
+    text.split_whitespace()
+        .skip_while(|t| *t != "inet")
+        .nth(1)
+        .map(|addr| addr.split('/').next().unwrap_or(addr).to_string())
 }
 
 /// Decide what to run from what doctor found. Pure inspection — no
@@ -595,7 +670,7 @@ fn handle(d: &Arc<Mutex<Daemon>>, stream: std::os::unix::net::UnixStream) {
     }
 }
 
-fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
+pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
     let result = (|| -> Result<Response, String> {
         let d = d.lock().map_err(|_| "state poisoned".to_string())?;
         match req {
@@ -614,6 +689,9 @@ fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
                         devices_seen: store::count_devices(&d.conn).map_err(err_str)?,
                         active_passes: store::count_active_passes(&d.conn, now_ts)
                             .map_err(err_str)?,
+                        panel_urls: d.panel_urls.clone(),
+                        admin_passphrase: d.auth.passphrase().to_string(),
+                        sessions: d.auth.session_count(),
                     }),
                 })
             }
@@ -656,6 +734,11 @@ fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
                 store::unfriend(&d.conn, &mac).map_err(err_str)?;
                 paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                Ok(Response::ok_empty())
+            }
+            Request::Rename { mac, label } => {
+                let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
+                store::set_device_label(&d.conn, &mac, label.as_deref(), now()).map_err(err_str)?;
                 Ok(Response::ok_empty())
             }
             Request::Shutdown => {

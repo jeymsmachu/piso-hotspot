@@ -1,9 +1,11 @@
 //! piso-hotspot: pay-per-usage wifi hotspot.
 
+mod auth;
 mod config;
 mod control;
 mod daemon;
 mod doctor;
+mod http;
 mod iwlist;
 mod leases;
 mod mac;
@@ -171,6 +173,14 @@ fn cmd_status() -> CmdResult {
         "  devices    {} seen, {} with active passes",
         s.devices_seen, s.active_passes
     );
+    println!("  panel:");
+    for url in &s.panel_urls {
+        println!("    {url}");
+    }
+    if s.sessions > 0 {
+        println!("  sessions:  {} active", s.sessions);
+    }
+    println!("  admin passphrase: {}", s.admin_passphrase);
     Ok(())
 }
 

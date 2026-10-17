@@ -1,0 +1,20 @@
+/* piso-hotspot admin — dino palette (Chromium's offline runner).
+   Light:  bg #f7f7f7, ink #535353
+   Dark:   bg #323232, ink #f7f7f7  */
+:root {
+  --bg: #f7f7f7;
+  --ink: #535353;
+  --line: #d9d9d9;
+  --accent: #0d9488;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #323232; --ink: #f7f7f7; --line: #535353; }
+}
+html[data-theme="light"] { --bg: #f7f7f7; --ink: #535353; --line: #d9d9d9; }
+html[data-theme="dark"]  { --bg: #323232; --ink: #f7f7f7; --line: #535353; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: ui-monospace, "Cascadia Mono", "Courier New", monospace;
+}
+#app { max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }

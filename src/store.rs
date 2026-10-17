@@ -99,7 +99,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 // ------------------------------------------------------------------ queries
 
 /// A device row as shown by `piso-hotspot list`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct DeviceRow {
     pub mac: String,
     pub label: Option<String>,
@@ -110,7 +110,7 @@ pub struct DeviceRow {
     pub last_seen: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct FriendRow {
     pub mac: String,
     pub label: Option<String>,
@@ -293,6 +293,32 @@ pub fn count_active_passes(conn: &Connection, now: i64) -> Result<i64, StoreErro
         [now],
         |r| r.get(0),
     )?)
+}
+
+/// Set (or clear, with `None`) the operator's label for a device.
+/// Creates the row if the device has never been seen.
+pub fn set_device_label(
+    conn: &Connection,
+    mac: &crate::mac::MacAddr,
+    label: Option<&str>,
+    now: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO devices (mac, label, first_seen, last_seen) VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(mac) DO UPDATE SET label = ?2, last_seen = ?3",
+        rusqlite::params![mac.to_string(), label, now],
+    )?;
+    Ok(())
+}
+
+/// Revenue since `since` (unix ts): total in the minor unit and count.
+pub fn revenue_since(conn: &Connection, since: i64) -> Result<(i64, i64), StoreError> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(price_minor), 0), COUNT(*) FROM sales WHERE sold_at >= ?1",
+        [since],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -552,5 +578,46 @@ mod tests {
         assert_eq!(count_devices(&conn).unwrap(), 2);
         assert_eq!(count_active_passes(&conn, now).unwrap(), 1);
         assert_eq!(count_active_passes(&conn, now + 901).unwrap(), 0);
+    }
+
+    #[test]
+    fn set_device_label_creates_updates_clears() {
+        let path = temp_db("label");
+        let conn = open(&path).unwrap();
+        let now = 1_700_000_000;
+        set_device_label(&conn, &mac("aa:bb:cc:dd:ee:99"), Some("TestDevice"), now).unwrap();
+        let rows = list_devices(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label.as_deref(), Some("TestDevice"));
+        // Timestamps must be real timestamps, not the mac string.
+        assert_eq!(rows[0].first_seen, now);
+
+        set_device_label(&conn, &mac("aa:bb:cc:dd:ee:99"), None, now + 5).unwrap();
+        let rows = list_devices(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "update must not duplicate");
+        assert_eq!(
+            rows[0].label, None,
+            "clearing falls back to device-reported"
+        );
+        assert_eq!(rows[0].last_seen, now + 5);
+    }
+
+    #[test]
+    fn revenue_since_counts_sales() {
+        let path = temp_db("revenue");
+        let conn = open(&path).unwrap();
+        let now = 1_700_000_000;
+        let quick = crate::passes::default_passes()
+            .into_iter()
+            .find(|p| p.id == "quick")
+            .unwrap();
+        grant(&conn, &mac("aa:bb:cc:dd:ee:01"), &quick, now, "PHP").unwrap();
+        grant(&conn, &mac("aa:bb:cc:dd:ee:02"), &quick, now + 60, "PHP").unwrap();
+        let (total, count) = revenue_since(&conn, now).unwrap();
+        assert_eq!((total, count), (600, 2));
+        let (total, count) = revenue_since(&conn, now + 30).unwrap();
+        assert_eq!((total, count), (300, 1));
+        let (total, count) = revenue_since(&conn, now + 600).unwrap();
+        assert_eq!((total, count), (0, 0));
     }
 }

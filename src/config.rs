@@ -62,6 +62,56 @@ pub struct Config {
     pub currency: String,
     pub passes: Vec<PassDef>,
     pub blocked_page: BlockedPage,
+    pub admin: AdminSettings,
+    pub portal: PortalSettings,
+    pub ui: UiSettings,
+    pub bandwidth: BandwidthSettings,
+}
+
+/// Panel login. Empty passphrase = a fresh random one per start,
+/// printed by `piso-hotspot status`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminSettings {
+    pub passphrase: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PortalSettings {
+    /// Serve the captive portal (DNS hijack + notice pages).
+    pub enabled: bool,
+}
+
+impl Default for PortalSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// Follow the device (prefers-color-scheme).
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    pub theme: Theme,
+}
+
+/// Client-facing traffic caps, in bytes per second (1 MB/s = 1_000_000).
+/// Applied in-kernel with `tc`; the host machine keeps full speed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BandwidthSettings {
+    pub max_down_bytes_per_sec: Option<u64>,
+    pub max_up_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,6 +143,10 @@ pub struct BlockedPage {
     pub title: String,
     pub message: String,
     pub footer: String,
+    /// How to pay: free text shown on the portal (e.g. GCash details).
+    pub payment_instructions: String,
+    /// List the configured passes and prices on the portal.
+    pub show_prices: bool,
 }
 
 impl Default for Config {
@@ -103,6 +157,10 @@ impl Default for Config {
             currency: "PHP".to_string(),
             passes: passes::default_passes(),
             blocked_page: BlockedPage::default(),
+            admin: AdminSettings::default(),
+            portal: PortalSettings::default(),
+            ui: UiSettings::default(),
+            bandwidth: BandwidthSettings::default(),
         }
     }
 }
@@ -128,6 +186,8 @@ impl Default for BlockedPage {
             title: "No internet yet".to_string(),
             message: "See the operator to buy a pass.".to_string(),
             footer: String::new(),
+            payment_instructions: String::new(),
+            show_prices: true,
         }
     }
 }
@@ -189,6 +249,26 @@ impl Config {
             problems.push(format!(
                 "ap.country_code must be a 2-letter ISO code like \"PH\", got {country:?}"
             ));
+        }
+        if !self.admin.passphrase.is_empty() && self.admin.passphrase.len() < 8 {
+            problems.push(
+                "admin.passphrase must be empty (random per start) or at least 8 characters"
+                    .to_string(),
+            );
+        }
+        for (name, cap) in [
+            (
+                "bandwidth.max_down_bytes_per_sec",
+                self.bandwidth.max_down_bytes_per_sec,
+            ),
+            (
+                "bandwidth.max_up_bytes_per_sec",
+                self.bandwidth.max_up_bytes_per_sec,
+            ),
+        ] {
+            if cap == Some(0) {
+                problems.push(format!("{name}: set null for unlimited, not 0"));
+            }
         }
         if self.passes.is_empty() {
             problems.push("at least one pass must be configured".to_string());
@@ -291,5 +371,54 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.ap.channel = 166;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn new_sections_parse_from_partial_file() {
+        let dir = std::env::temp_dir().join(format!("piso-cfg-p3-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"admin":{"passphrase":"hunter22"},"ui":{"theme":"dark"},
+                "bandwidth":{"max_down_bytes_per_sec":20000000},
+                "blocked_page":{"payment_instructions":"GCash 0917..."}}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.admin.passphrase, "hunter22");
+        assert_eq!(cfg.ui.theme, Theme::Dark);
+        assert_eq!(cfg.bandwidth.max_down_bytes_per_sec, Some(20_000_000));
+        assert_eq!(cfg.bandwidth.max_up_bytes_per_sec, None);
+        assert!(cfg.portal.enabled);
+        assert!(cfg.blocked_page.show_prices);
+        assert_eq!(cfg.blocked_page.payment_instructions, "GCash 0917...");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn short_admin_passphrase_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.admin.passphrase = "short".into();
+        assert!(cfg.validate().is_err());
+        cfg.admin.passphrase = String::new(); // random-per-start
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn zero_bandwidth_cap_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.bandwidth.max_down_bytes_per_sec = Some(0);
+        assert!(cfg.validate().is_err());
+        cfg.bandwidth.max_down_bytes_per_sec = None; // unlimited
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn theme_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&Theme::Auto).unwrap(), r#""auto""#);
+        assert_eq!(serde_json::to_string(&Theme::Dark).unwrap(), r#""dark""#);
+        let t: Theme = serde_json::from_str(r#""light""#).unwrap();
+        assert_eq!(t, Theme::Light);
     }
 }

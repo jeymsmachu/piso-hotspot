@@ -37,6 +37,11 @@ pub enum Request {
     Unfriend {
         mac: String,
     },
+    /// Set (or clear with null) the operator's device label.
+    Rename {
+        mac: String,
+        label: Option<String>,
+    },
     /// Orderly shutdown (used by `piso-hotspot stop`).
     Shutdown,
 }
@@ -50,6 +55,12 @@ pub struct StatusInfo {
     pub started_at: i64,
     pub devices_seen: i64,
     pub active_passes: i64,
+    /// Every URL the panel answers on right now.
+    pub panel_urls: Vec<String>,
+    /// The passphrase that works this run (chosen or generated).
+    pub admin_passphrase: String,
+    /// Live panel sessions.
+    pub sessions: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -159,6 +170,14 @@ mod tests {
             Request::Unfriend {
                 mac: "aa:bb:cc:dd:ee:ff".into(),
             },
+            Request::Rename {
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                label: Some("Redmi".into()),
+            },
+            Request::Rename {
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                label: None,
+            },
             Request::Shutdown,
         ];
         for req in cases {
@@ -190,6 +209,9 @@ mod tests {
             started_at: 1_700_000_000,
             devices_seen: 3,
             active_passes: 1,
+            panel_urls: vec!["http://10.10.0.1:8080".into()],
+            admin_passphrase: "ABCD-EFGH".into(),
+            sessions: 1,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: StatusInfo = serde_json::from_str(&json).unwrap();
