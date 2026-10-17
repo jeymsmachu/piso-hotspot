@@ -52,8 +52,10 @@ pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> Stri
             pass = cfg.ap.passphrase,
         ));
     }
-    // The daemon runs with a closed lid on battery; keep the log quiet.
-    out.push_str("logger_syslog_level=2\n");
+    // Hostapd diagnostics: disconnect reasons must be visible while
+    // the field is young (0 = debug). Tune back up later for battery.
+    out.push_str("logger_syslog_level=0\n");
+    out.push_str("logger_stdout_level=0\n");
     out
 }
 

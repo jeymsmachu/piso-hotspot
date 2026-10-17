@@ -7,7 +7,7 @@
 
 use rusqlite::Connection;
 
-use crate::nft::{Firewall, SET_ALLOWED, SET_FRIENDS, diff};
+use crate::nft::{Firewall, SET_ALLOWED, SET_BLOCKED, SET_FRIENDS, diff};
 use crate::store;
 
 #[derive(thiserror::Error, Debug)]
@@ -26,6 +26,8 @@ pub struct Report {
     pub allowed_removed: usize,
     pub friends_added: usize,
     pub friends_removed: usize,
+    pub blocked_added: usize,
+    pub blocked_removed: usize,
 }
 
 impl Report {
@@ -35,6 +37,8 @@ impl Report {
             || self.allowed_removed > 0
             || self.friends_added > 0
             || self.friends_removed > 0
+            || self.blocked_added > 0
+            || self.blocked_removed > 0
     }
 }
 
@@ -54,30 +58,43 @@ pub fn reconcile(conn: &Connection, fw: &Firewall, now: i64) -> Result<Report, P
     };
 
     let want_allowed = store::paid_macs(conn, now)?;
-    let have_allowed = fw.set_members(SET_ALLOWED)?;
-    let d = diff(&want_allowed, &have_allowed);
-    for mac in &d.add {
-        fw.set_add(SET_ALLOWED, mac)?;
-    }
-    for mac in &d.remove {
-        fw.set_remove(SET_ALLOWED, mac)?;
-    }
-    report.allowed_added = d.add.len();
-    report.allowed_removed = d.remove.len();
-
     let want_friends = store::friend_macs(conn)?;
-    let have_friends = fw.set_members(SET_FRIENDS)?;
-    let d = diff(&want_friends, &have_friends);
-    for mac in &d.add {
-        fw.set_add(SET_FRIENDS, mac)?;
-    }
-    for mac in &d.remove {
-        fw.set_remove(SET_FRIENDS, mac)?;
-    }
-    report.friends_added = d.add.len();
-    report.friends_removed = d.remove.len();
+
+    let (n_add, n_rem) = sync_set(fw, SET_ALLOWED, &want_allowed, fw.set_members(SET_ALLOWED)?)?;
+    report.allowed_added = n_add;
+    report.allowed_removed = n_rem;
+
+    let (n_add, n_rem) = sync_set(fw, SET_FRIENDS, &want_friends, fw.set_members(SET_FRIENDS)?)?;
+    report.friends_added = n_add;
+    report.friends_removed = n_rem;
+
+    // Every known device without access gets attributed drop counters.
+    let want_blocked: Vec<crate::mac::MacAddr> = store::all_device_macs(conn)?
+        .into_iter()
+        .filter(|m| !want_allowed.contains(m) && !want_friends.contains(m))
+        .collect();
+    let (n_add, n_rem) = sync_set(fw, SET_BLOCKED, &want_blocked, fw.set_members(SET_BLOCKED)?)?;
+    report.blocked_added = n_add;
+    report.blocked_removed = n_rem;
 
     Ok(report)
+}
+
+fn sync_set(
+    fw: &Firewall,
+    set: &str,
+    want: &[crate::mac::MacAddr],
+    have: Vec<crate::nft::SetElement>,
+) -> Result<(usize, usize), PaywallError> {
+    let have: Vec<crate::mac::MacAddr> = have.into_iter().map(|e| e.mac).collect();
+    let d = diff(want, &have);
+    for mac in &d.add {
+        fw.set_add(set, mac)?;
+    }
+    for mac in &d.remove {
+        fw.set_remove(set, mac)?;
+    }
+    Ok((d.add.len(), d.remove.len()))
 }
 
 /// Apply one grant/revoke immediately instead of waiting for the tick.
@@ -91,13 +108,20 @@ pub fn apply_device(
     let friend = store::friend_macs(conn)?.contains(&mac);
     if paid {
         fw.set_add(SET_ALLOWED, &mac)?;
+        fw.set_remove(SET_BLOCKED, &mac)?;
     } else {
         fw.set_remove(SET_ALLOWED, &mac)?;
     }
     if friend {
         fw.set_add(SET_FRIENDS, &mac)?;
+        fw.set_remove(SET_BLOCKED, &mac)?;
     } else {
         fw.set_remove(SET_FRIENDS, &mac)?;
+    }
+    if !paid && !friend {
+        // The device row exists by now (grant/revoke/touch created it),
+        // so attribute its future drops to it.
+        fw.set_add(SET_BLOCKED, &mac)?;
     }
     Ok(())
 }

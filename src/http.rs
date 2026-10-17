@@ -194,6 +194,33 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
     let devices = crate::store::list_devices(&d.conn).unwrap_or_default();
     let friends = crate::store::list_friends(&d.conn).unwrap_or_default();
 
+    // Live kernel counters: aggregate per set plus per-MAC, so the
+    // dashboard can derive rates client-side between polls.
+    let allowed_elems =
+        d.fw.set_members(crate::nft::SET_ALLOWED)
+            .unwrap_or_default();
+    let friend_elems =
+        d.fw.set_members(crate::nft::SET_FRIENDS)
+            .unwrap_or_default();
+    let blocked_elems =
+        d.fw.set_members(crate::nft::SET_BLOCKED)
+            .unwrap_or_default();
+    let mut by_mac = serde_json::Map::new();
+    for set in [&allowed_elems, &friend_elems, &blocked_elems] {
+        for el in set {
+            by_mac.insert(
+                el.mac.to_string(),
+                json!({ "packets": el.packets, "bytes": el.bytes }),
+            );
+        }
+    }
+    let totals = |v: &[crate::nft::SetElement]| {
+        json!({
+            "packets": v.iter().map(|e| e.packets).sum::<u64>(),
+            "bytes": v.iter().map(|e| e.bytes).sum::<u64>(),
+        })
+    };
+
     Json(json!({
         "status": {
             "mode": d.mode,
@@ -214,8 +241,14 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
         "passes": d.cfg.passes,
         "currency": d.cfg.currency,
         "theme": serde_json::to_value(d.cfg.ui.theme).unwrap_or_default(),
-        "bandwidth": d.cfg.bandwidth,
         "revenue_today": { "total_minor": revenue.0, "count": revenue.1 },
+        "caps": d.cfg.bandwidth,
+        "traffic": {
+            "allowed": totals(&allowed_elems),
+            "friends": totals(&friend_elems),
+            "blocked": totals(&blocked_elems),
+            "by_mac": by_mac,
+        },
     }))
     .into_response()
 }

@@ -15,6 +15,18 @@ use crate::mac::MacAddr;
 /// Set names used by the ruleset.
 pub const SET_ALLOWED: &str = "allowed";
 pub const SET_FRIENDS: &str = "friends";
+/// Known devices *without* access. Never an allow-rule target — it
+/// exists so per-device drop counters can attribute "bandwidth eaten
+/// by waiting devices".
+pub const SET_BLOCKED: &str = "blocked";
+
+/// One member of a counter-enabled set as printed by `nft list set`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetElement {
+    pub mac: MacAddr,
+    pub packets: u64,
+    pub bytes: u64,
+}
 
 pub const TABLE: &str = "piso";
 
@@ -67,13 +79,18 @@ impl Firewall {
     /// Render the complete table for `nft -f -`.
     pub fn render(&self) -> String {
         let ap = validate_iface(&self.ap_iface).expect("validated at construction");
-        // Web ports for hotspot clients: the captive portal (80) and the
-        // admin panel. Port 0 means "not configured" and stays closed.
+        // Web ports for hotspot clients: the captive portal (80) and
+        // the admin panel. Port 443 is answered-with-RST on purpose:
+        // browsers' HTTPS-first mode probes https:// on these addresses,
+        // and a silent drop makes them hang forever — a fast refusal
+        // makes them fall back to plain HTTP, where the portal lives.
+        // Port 0 means "not configured" and stays closed.
         let mut web_ports: Vec<u16> = Vec::new();
         if self.portal_enabled {
             web_ports.push(80);
+            web_ports.push(443);
         }
-        if self.panel_port != 0 && self.panel_port != 80 {
+        if self.panel_port != 0 && self.panel_port != 80 && !web_ports.contains(&self.panel_port) {
             web_ports.push(self.panel_port);
         }
         let web_rule = match web_ports.len() {
@@ -84,13 +101,26 @@ impl Firewall {
                 format!("        tcp dport {{ {} }} accept\n", list.join(", "))
             }
         };
+        // QUIC (HTTP/3) probes to https:// get an immediate
+        // port-unreachable instead of hanging the same way.
+        let udp_rule = if self.portal_enabled {
+            "        udp dport 443 accept\n"
+        } else {
+            ""
+        };
         let mut out = format!(
             "table inet {TABLE} {{
     set {SET_ALLOWED} {{
         type ether_addr
+        counter
     }}
     set {SET_FRIENDS} {{
         type ether_addr
+        counter
+    }}
+    set {SET_BLOCKED} {{
+        type ether_addr
+        counter
     }}
 
     chain forward {{
@@ -99,10 +129,11 @@ impl Firewall {
         iifname != \"{ap}\" accept
         # Friends and paying clients may pass; everyone else is dropped,
         # existing connections included: revoke means no internet.
-        # Counters on the accept rules give the operator a live view of
-        # whether granted clients are actually flowing.
+        # Element counters show per-device traffic on the accept side;
+        # the blocked set attributes drops to known waiting devices.
         ether saddr @{SET_FRIENDS} counter accept
         ether saddr @{SET_ALLOWED} counter accept
+        ether saddr @{SET_BLOCKED} counter drop
         counter drop
     }}
 
@@ -116,7 +147,7 @@ impl Firewall {
         udp dport {{ 67, 53 }} accept
         tcp dport 53 accept
         icmp type echo-request accept
-{web_rule}        counter drop
+{web_rule}{udp_rule}        counter drop
     }}
 "
         );
@@ -200,8 +231,8 @@ impl Firewall {
         Self::run(&["list", "set", "inet", TABLE, set], None)
     }
 
-    /// Current members of a set, parsed from kernel output.
-    pub fn set_members(&self, set: &str) -> Result<Vec<MacAddr>, NftError> {
+    /// Current members of a set (with their counters), from kernel output.
+    pub fn set_members(&self, set: &str) -> Result<Vec<SetElement>, NftError> {
         let out = self.set_members_raw(set)?;
         Ok(parse_elements(&out))
     }
@@ -230,9 +261,10 @@ impl Firewall {
     }
 }
 
-/// Parse `elements = { aa:bb:…, cc:dd:… }` (possibly wrapped over
-/// several lines) out of `nft list set` output.
-pub fn parse_elements(output: &str) -> Vec<MacAddr> {
+/// Parse `elements = { aa:bb:… [counter packets N bytes M], … }`
+/// (possibly wrapped over several lines) out of `nft list set` output.
+/// Elements without counters report zeros.
+pub fn parse_elements(output: &str) -> Vec<SetElement> {
     let mut members = Vec::new();
     let Some(start) = output.find("elements") else {
         return members;
@@ -245,13 +277,30 @@ pub fn parse_elements(output: &str) -> Vec<MacAddr> {
         return members;
     };
     for token in rest[..close].split(',') {
-        let token = token.trim();
-        if token.is_empty() {
+        let mut fields = token.split_whitespace();
+        let (Some(mac), rest) = (fields.next(), fields) else {
             continue;
-        }
-        if let Ok(mac) = token.parse() {
-            members.push(mac);
-        }
+        };
+        let Ok(mac) = mac.parse::<MacAddr>() else {
+            continue;
+        };
+        // Optional: "counter packets N bytes M"
+        let rest: Vec<&str> = rest.collect();
+        let (packets, bytes) = match rest.iter().position(|f| *f == "packets") {
+            Some(i) => (
+                rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+                rest.iter()
+                    .position(|f| *f == "bytes")
+                    .and_then(|j| rest.get(j + 1).and_then(|v| v.parse().ok()))
+                    .unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+        members.push(SetElement {
+            mac,
+            packets,
+            bytes,
+        });
     }
     members
 }
@@ -293,15 +342,26 @@ mod tests {
         assert!(rules.contains("iifname != \"wlan0\" accept"));
         assert!(rules.contains("ether saddr @allowed counter accept"));
         assert!(rules.contains("counter drop"));
-        // Every policy decision is observable: both accepts, the
-        // forward drop, and the input drop all carry counters.
-        assert_eq!(rules.matches("counter").count(), 4);
+        // Every policy decision is observable: three set-declaration
+        // counters plus five rule counters (friends, allowed, blocked,
+        // forward drop, input drop). Comment lines are ignored.
+        let counted = rules
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("counter"))
+            .count();
+        assert_eq!(counted, 8);
     }
 
     #[test]
     fn portal_and_panel_ports_open_to_clients() {
         let rules = fw(None).render();
-        assert!(rules.contains("tcp dport { 80, 8080 } accept"), "{rules}");
+        assert!(
+            rules.contains("tcp dport { 80, 443, 8080 } accept"),
+            "{rules}"
+        );
+        // QUIC fast-fail rides along with the portal.
+        assert!(rules.contains("udp dport 443 accept"), "{rules}");
     }
 
     #[test]
@@ -324,11 +384,16 @@ mod tests {
         let input = rules.split("chain input").nth(1).expect("input chain");
         // DHCP/DNS legitimately keep their ports; no *web* port may open.
         assert!(!input.contains("dport 80"), "fail closed: {input}");
-        // With the portal on, port 80 still opens for clients.
+        assert!(
+            !input.contains("443"),
+            "no fast-fail without portal: {input}"
+        );
+        // With the portal on, the portal ports still open (panel stays closed).
         f.portal_enabled = true;
         let rules = f.render();
         let input = rules.split("chain input").nth(1).expect("input chain");
-        assert!(input.contains("tcp dport 80 accept"), "{input}");
+        assert!(input.contains("tcp dport { 80, 443 } accept"), "{input}");
+        assert!(!input.contains("8080"), "panel stays closed: {input}");
     }
 
     #[test]
@@ -337,8 +402,12 @@ mod tests {
         f.panel_port = 80;
         let rules = f.render();
         let input = rules.split("chain input").nth(1).expect("input chain");
-        assert!(input.contains("tcp dport 80 accept"), "{input}");
-        assert!(!input.contains("{ 80"), "80 must appear once: {input}");
+        // Portal already contributed 80; the list must contain it once.
+        assert_eq!(input.matches("tcp dport { 80, 443 } accept").count(), 1);
+        assert!(
+            !input.contains("tcp dport 80 accept"),
+            "unlisted bare 80: {input}"
+        );
     }
 
     #[test]
@@ -426,8 +495,31 @@ table inet piso {
 ";
         let members = parse_elements(out);
         assert_eq!(members.len(), 3);
-        assert_eq!(members[0].to_string(), "aa:bb:cc:dd:ee:01");
-        assert_eq!(members[2].to_string(), "77:88:99:aa:bb:cc");
+        assert_eq!(members[0].mac.to_string(), "aa:bb:cc:dd:ee:01");
+        assert_eq!(members[2].mac.to_string(), "77:88:99:aa:bb:cc");
+        // No counters shown → zeros.
+        assert!(members.iter().all(|e| e.packets == 0 && e.bytes == 0));
+    }
+
+    #[test]
+    fn parses_element_counters() {
+        let out = "
+table inet piso {
+    set allowed {
+        type ether_addr
+        counter
+        elements = { 42:61:7e:6c:ee:d2 counter packets 70 bytes 4620,
+            aa:bb:cc:dd:ee:01 counter packets 0 bytes 0 }
+    }
+}
+";
+        let members = parse_elements(out);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].mac.to_string(), "42:61:7e:6c:ee:d2");
+        assert_eq!(members[0].packets, 70);
+        assert_eq!(members[0].bytes, 4620);
+        assert_eq!(members[1].packets, 0);
+        assert_eq!(members[1].bytes, 0);
     }
 
     #[test]

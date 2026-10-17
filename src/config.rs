@@ -135,6 +135,9 @@ pub struct ApSettings {
     /// Regulatory domain advertised to clients, e.g. `"PH"`. Omitted
     /// from hostapd config when unset (the kernel's default applies).
     pub country_code: Option<String>,
+    /// Force the hotspot onto this wifi interface (hosts with several
+    /// radios). Unset: the first AP-capable radio is used.
+    pub interface: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,6 +179,7 @@ impl Default for ApSettings {
             isolate_clients: true,
             ieee80211n: true,
             country_code: None,
+            interface: None,
         }
     }
 }
@@ -249,6 +253,11 @@ impl Config {
             problems.push(format!(
                 "ap.country_code must be a 2-letter ISO code like \"PH\", got {country:?}"
             ));
+        }
+        if let Some(want) = &self.ap.interface
+            && want.trim().is_empty()
+        {
+            problems.push("ap.interface must be a real interface name or unset".to_string());
         }
         if !self.admin.passphrase.is_empty() && self.admin.passphrase.len() < 8 {
             problems.push(

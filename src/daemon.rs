@@ -29,7 +29,7 @@ use crate::nft::Firewall;
 use crate::paywall;
 use crate::radio;
 use crate::store;
-use crate::{leases, wireless};
+use crate::{leases, shaper, wireless};
 
 const PID_FILE: &str = "/run/piso-hotspot/daemon.pid";
 const LOG_FILE: &str = "/run/piso-hotspot/daemon.log";
@@ -209,6 +209,7 @@ fn cleanup_from_record() {
         portal_enabled: false,
     };
     let _ = fw.uninstall();
+    let _ = shaper::clear(&record.ap_iface);
     let _ = radio::set_gateway(&record.ap_iface, &record.gateway, false);
     if let Some(prev) = &record.ip_forward_prev
         && let Ok(current) = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
@@ -445,18 +446,30 @@ fn plan(opts: Opts, cfg: &Config) -> Result<Plan, String> {
         return wifi_uplink_plan(&report, cfg);
     }
 
-    let ap_radio = report
-        .radios
-        .iter()
-        .find(|r| r.supports_ap)
-        .ok_or("no wifi radio supports AP mode")?;
-    let ap_iface = ap_radio
-        .interfaces
-        .first()
-        .ok_or("AP-capable radio has no interface")?
-        .clone();
-
     let gateway = cfg.gateway;
+    // Which radio becomes the AP: the operator's explicit choice wins
+    // (multi-radio hosts), else the first AP-capable one.
+    let ap_iface = match cfg.ap.interface.as_deref() {
+        Some(want) => {
+            let usable = report
+                .radios
+                .iter()
+                .any(|r| r.supports_ap && r.interfaces.iter().any(|i| i == want));
+            if !usable {
+                return Err(format!(
+                    "ap.interface {want:?}: not found or the radio lacks AP mode \
+                     (`piso-hotspot doctor` lists candidates)"
+                ));
+            }
+            want.to_string()
+        }
+        None => report
+            .radios
+            .iter()
+            .find(|r| r.supports_ap)
+            .and_then(|r| r.interfaces.first().cloned())
+            .ok_or("no wifi radio supports AP mode")?,
+    };
     let uplink = if opts.offline {
         None
     } else {
@@ -532,6 +545,17 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
 
     radio::set_gateway(&plan.ap_iface, &plan.gateway.to_string(), true)
         .map_err(|e| format!("setting gateway address: {e}"))?;
+
+    // Client bandwidth caps: in-kernel, applied before anything serves
+    // traffic. A cap that cannot be enforced fails the start loudly —
+    // silently unlimited is worse than refusing to run.
+    let caps = shaper::Caps {
+        down: d.cfg.bandwidth.max_down_bytes_per_sec,
+        up: d.cfg.bandwidth.max_up_bytes_per_sec,
+    };
+    if !caps.is_unlimited() {
+        shaper::apply(&plan.ap_iface, caps).map_err(|e| format!("applying bandwidth caps: {e}"))?;
+    }
 
     d.ip_forward_prev =
         Some(radio::set_ip_forward(true).map_err(|e| format!("enabling ip_forward: {e}"))?);
@@ -616,6 +640,7 @@ fn teardown(d: &mut Daemon) {
         }
     }
     let _ = d.fw.uninstall();
+    let _ = shaper::clear(&d.fw.ap_iface);
     let gateway = d.fw.gateway.to_string();
     let _ = radio::set_gateway(&d.fw.ap_iface, &gateway, false);
     if let Some(prev) = d.ip_forward_prev.take() {

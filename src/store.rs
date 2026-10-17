@@ -257,6 +257,17 @@ pub fn paid_macs(conn: &Connection, now: i64) -> Result<Vec<crate::mac::MacAddr>
     Ok(macs)
 }
 
+/// Every MAC the store knows about (seen, granted, or renamed).
+pub fn all_device_macs(conn: &Connection) -> Result<Vec<crate::mac::MacAddr>, StoreError> {
+    let mut stmt = conn.prepare("SELECT mac FROM devices")?;
+    let macs = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|s| s.ok())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Ok(macs)
+}
+
 /// MACs with unlimited access, for the firewall's `friends` set.
 pub fn friend_macs(conn: &Connection) -> Result<Vec<crate::mac::MacAddr>, StoreError> {
     let mut stmt = conn.prepare("SELECT mac FROM friends")?;

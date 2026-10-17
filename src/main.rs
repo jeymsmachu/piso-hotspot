@@ -14,6 +14,7 @@ mod passes;
 mod paywall;
 mod portal;
 mod radio;
+mod shaper;
 mod store;
 mod viface;
 mod wireless;
