@@ -29,7 +29,7 @@ use crate::nft::Firewall;
 use crate::paywall;
 use crate::radio;
 use crate::store;
-use crate::{leases, shaper, wireless};
+use crate::{leases, shaper, ufw, wireless};
 
 const PID_FILE: &str = "/run/piso-hotspot/daemon.pid";
 const LOG_FILE: &str = "/run/piso-hotspot/daemon.log";
@@ -72,6 +72,15 @@ pub struct RunningRecord {
     /// `/proc/sys/net/ipv4/ip_forward` before we touched it.
     pub ip_forward_prev: Option<String>,
     pub started_at: i64,
+    /// UFW rules added at start (removed at stop).
+    #[serde(default)]
+    pub portal_enabled: bool,
+    #[serde(default = "default_panel_port")]
+    pub panel_port: u16,
+}
+
+fn default_panel_port() -> u16 {
+    8080
 }
 
 // ------------------------------------------------------------- parent side
@@ -209,6 +218,7 @@ fn cleanup_from_record() {
         portal_enabled: false,
     };
     let _ = fw.uninstall();
+    ufw::close(&record.ap_iface, record.portal_enabled, record.panel_port);
     let _ = shaper::clear(&record.ap_iface);
     let _ = radio::set_gateway(&record.ap_iface, &record.gateway, false);
     if let Some(prev) = &record.ip_forward_prev
@@ -301,6 +311,8 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         gateway: plan.gateway.to_string(),
         ip_forward_prev: None,
         started_at: now(),
+        portal_enabled: cfg.portal.enabled,
+        panel_port: cfg.ap.port,
     };
     fs::write(
         RUNNING_FILE,
@@ -542,6 +554,11 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
     // Paywall first: installed before forwarding exists.
     d.fw.install()
         .map_err(|e| format!("installing paywall: {e}"))?;
+    // UFW's INPUT chain registers before any nft rule we write — if it
+    // is active, our ports must be opened there too or DHCP/portal/panel
+    // die silently. Failing here is deliberate: half-working is worse.
+    ufw::open(&plan.ap_iface, d.cfg.portal.enabled, d.cfg.ap.port)
+        .map_err(|e| format!("opening UFW ports for hotspot clients: {e}"))?;
 
     radio::set_gateway(&plan.ap_iface, &plan.gateway.to_string(), true)
         .map_err(|e| format!("setting gateway address: {e}"))?;
@@ -640,6 +657,7 @@ fn teardown(d: &mut Daemon) {
         }
     }
     let _ = d.fw.uninstall();
+    ufw::close(&d.fw.ap_iface, d.cfg.portal.enabled, d.cfg.ap.port);
     let _ = shaper::clear(&d.fw.ap_iface);
     let gateway = d.fw.gateway.to_string();
     let _ = radio::set_gateway(&d.fw.ap_iface, &gateway, false);

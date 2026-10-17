@@ -16,6 +16,7 @@ mod portal;
 mod radio;
 mod shaper;
 mod store;
+mod ufw;
 mod viface;
 mod wireless;
 

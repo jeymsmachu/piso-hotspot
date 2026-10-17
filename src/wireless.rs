@@ -67,11 +67,13 @@ pub fn dnsmasq_config(cfg: &Config, iface: &str) -> String {
          interface={iface}\n\
          bind-interfaces\n\
          dhcp-range={first},{last},255.255.255.0,1h\n\
+         dhcp-broadcast\n\
          dhcp-leasefile={leases}\n\
          server=1.1.1.1\n\
          server=8.8.8.8\n\
          domain-needed\n\
-         bogus-priv\n",
+         bogus-priv\n\
+         log-dhcp\n",
         first = Ipv4Addr::new(octets[0], octets[1], octets[2], 10),
         last = Ipv4Addr::new(octets[0], octets[1], octets[2], 254),
         leases = LEASE_FILE,
@@ -159,6 +161,7 @@ mod tests {
         assert!(out.contains(&format!("dhcp-leasefile={LEASE_FILE}")));
         assert!(out.contains("interface=wlan0"));
         assert!(out.contains("bind-interfaces"));
+        assert!(out.contains("dhcp-broadcast"));
 
         c.gateway = Ipv4Addr::new(192, 168, 50, 1);
         let out = dnsmasq_config(&c, "ap0");
