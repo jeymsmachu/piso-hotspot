@@ -60,8 +60,21 @@ pub fn take(iface: &str) -> Result<(), RadioError> {
 }
 
 /// Hand `iface` back so NetworkManager can manage (and reconnect) it.
+///
+/// The mode also resets to managed/station: NetworkManager reapplies it
+/// on a real card, but an interface whose phy is not managed by NM (as
+/// in the virtual-radio harness) would otherwise be left beaconing.
+/// Best-effort throughout — the goal is "NM owns this card again".
 pub fn release(iface: &str) {
     nmcli(&["device", "set", iface, "managed", "yes"]);
+    // `iw set type` fails on an up interface and on a running AP: take
+    // the link down first, retype, then bring it back. Best effort — a
+    // real card is reclaimed by NetworkManager regardless.
+    let _ = link_set(iface, false);
+    let _ = Command::new("iw")
+        .args(["dev", iface, "set", "type", "managed"])
+        .output();
+    let _ = link_set(iface, true);
 }
 
 fn link_set(iface: &str, up: bool) -> bool {
