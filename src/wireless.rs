@@ -12,6 +12,19 @@ pub const HOSTAPD_CONF: &str = "/run/piso-hotspot/hostapd.conf";
 pub const DNSMASQ_CONF: &str = "/run/piso-hotspot/dnsmasq.conf";
 pub const LEASE_FILE: &str = "/run/piso-hotspot/dnsmasq.leases";
 
+/// Reject values that would break the line-oriented config format.
+/// Config validation already enforces this; the writer does not trust
+/// its caller (a config loaded before validation, a future code path).
+fn safe_line(value: &str) -> &str {
+    debug_assert!(
+        !value
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\'),
+        "unsafe hostapd config value: {value:?}"
+    );
+    value
+}
+
 /// hostapd configuration for the given interface on an explicit channel.
 ///
 /// Channel 1–14 is 2.4 GHz (`hw_mode=g`); anything above is 5/6 GHz
@@ -21,7 +34,7 @@ pub const LEASE_FILE: &str = "/run/piso-hotspot/dnsmasq.leases";
 pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> String {
     let mut out = format!(
         "interface={iface}\ndriver=nl80211\nssid={ssid}\nchannel={channel}\n",
-        ssid = cfg.ap.ssid,
+        ssid = safe_line(&cfg.ap.ssid),
     );
     out.push_str(if channel <= 14 {
         "hw_mode=g\n"
@@ -49,11 +62,10 @@ pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> Stri
              wpa_passphrase={pass}\n\
              wpa_key_mgmt=WPA-PSK\n\
              rsn_pairwise=CCMP\n",
-            pass = cfg.ap.passphrase,
+            pass = safe_line(&cfg.ap.passphrase),
         ));
     }
-    // Hostapd diagnostics: disconnect reasons must be visible while
-    // the field is young (0 = debug). Tune back up later for battery.
+    // Debug-level syslog: disconnect reasons stay visible.
     out.push_str("logger_syslog_level=0\n");
     out.push_str("logger_stdout_level=0\n");
     out

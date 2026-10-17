@@ -4,9 +4,6 @@
 //! Program-owned state (passes, friends, revenue) lives in SQLite instead —
 //! see [`crate::store`].
 
-// Only the path helpers have consumers until `up`/the panel land in P1+.
-#![allow(dead_code)]
-
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -230,11 +227,35 @@ impl Config {
                 self.ap.ssid.len()
             ));
         }
+        // The SSID is written verbatim into hostapd's line-oriented
+        // config; a newline or control byte would inject directives.
+        if self
+            .ap
+            .ssid
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+        {
+            problems.push(
+                "ap.ssid must not contain control characters, quotes, or backslashes".to_string(),
+            );
+        }
         if !self.ap.passphrase.is_empty() && !(8..=63).contains(&self.ap.passphrase.len()) {
             problems.push(format!(
                 "ap.passphrase must be empty (open network) or 8-63 characters, got {}",
                 self.ap.passphrase.len()
             ));
+        }
+        // Same line-oriented config, plus WPA2 PSKs are printable ASCII.
+        if self
+            .ap
+            .passphrase
+            .chars()
+            .any(|c| c.is_control() || !c.is_ascii())
+        {
+            problems.push(
+                "ap.passphrase must be printable ASCII (no control or non-ASCII characters)"
+                    .to_string(),
+            );
         }
         if self.ap.channel == 0 || self.ap.channel > 165 {
             problems.push(format!("ap.channel must be 1-165, got {}", self.ap.channel));
@@ -258,10 +279,31 @@ impl Config {
                 "ap.country_code must be a 2-letter ISO code like \"PH\", got {country:?}"
             ));
         }
+        // Interface names reach nft/hostapd/ip command lines and the
+        // ruleset text; apply the kernel's own alphabet up front.
+        let valid_iface = |name: &str| {
+            !name.is_empty()
+                && name.len() <= 15
+                // A leading dash would be parsed as a flag by tools we
+                // invoke (ufw, ip, iw); the kernel never needs one.
+                && !name.starts_with('-')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        };
         if let Some(want) = &self.ap.interface
-            && want.trim().is_empty()
+            && !valid_iface(want)
         {
-            problems.push("ap.interface must be a real interface name or unset".to_string());
+            problems.push(format!(
+                "ap.interface must be a real interface name (letters, digits, _ - .), got {want:?}"
+            ));
+        }
+        if let Some(want) = &self.ap.uplink
+            && !valid_iface(want)
+        {
+            problems.push(format!(
+                "ap.uplink must be a real interface name (letters, digits, _ - .), got {want:?}"
+            ));
         }
         if !self.admin.passphrase.is_empty() && self.admin.passphrase.len() < 8 {
             problems.push(
@@ -329,6 +371,38 @@ mod tests {
     fn ap_uplink_parses_from_json() {
         let cfg: Config = serde_json::from_str(r#"{"ap":{"uplink":"wlan2"}}"#).unwrap();
         assert_eq!(cfg.ap.uplink.as_deref(), Some("wlan2"));
+    }
+
+    #[test]
+    fn ssid_with_newline_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.ap.ssid = "school\nieee80211w=0".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ap.ssid"), "{err}");
+    }
+
+    #[test]
+    fn passphrase_with_control_bytes_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.ap.passphrase = "password\twith-tab".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ap.passphrase"), "{err}");
+    }
+
+    #[test]
+    fn iface_names_are_alphabet_checked() {
+        for bad in ["wlan0\nip link", "wlan 0", "wlan0;", ""] {
+            let mut cfg = Config::default();
+            cfg.ap.interface = Some(bad.to_string());
+            assert!(cfg.validate().is_err(), "accepted interface {bad:?}");
+            let mut cfg = Config::default();
+            cfg.ap.uplink = Some(bad.to_string());
+            assert!(cfg.validate().is_err(), "accepted uplink {bad:?}");
+        }
+        let mut cfg = Config::default();
+        cfg.ap.interface = Some("wlan0".to_string());
+        cfg.ap.uplink = Some("wlan1".to_string());
+        cfg.validate().unwrap();
     }
 
     #[test]

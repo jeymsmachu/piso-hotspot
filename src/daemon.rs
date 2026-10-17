@@ -404,6 +404,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     }
 }
 
+#[derive(Debug)]
 struct Plan {
     mode: String,
     ap_iface: String,
@@ -560,136 +561,141 @@ fn wifi_uplink_plan(report: &doctor::Report, cfg: &Config) -> Result<Plan, Strin
     })
 }
 
-/// `--dual-radio`: internet arrives over one radio as a station while a
-/// second radio beacons the AP. Both radios stay in their natural mode,
-/// so no driver concurrency is needed — just two radios.
-fn dual_radio_plan(report: &doctor::Report, cfg: &Config) -> Result<Plan, String> {
-    // The uplink station must be the one actually carrying internet:
-    // the interface with the default route. Falling back to "any
-    // connected station" would silently pick a dead one.
-    let default_routes = doctor::default_route_ifaces();
-    // An explicit `ap.uplink` wins: it names the interface the operator
-    // wants internet to leave through.
-    if let Some(want) = cfg.ap.uplink.as_deref() {
-        let radio = report
-            .radios
-            .iter()
-            .find(|r| r.interfaces.iter().any(|i| i == want))
-            .ok_or_else(|| format!("ap.uplink {want:?}: no such wifi interface"))?;
-        let candidates: Vec<&doctor::Radio> = report
-            .radios
-            .iter()
-            .filter(|r| r.supports_ap && r.phy != radio.phy)
-            .collect();
-        let ap_iface = match cfg.ap.interface.as_deref() {
-            Some(ap_want) => {
-                if !candidates
-                    .iter()
-                    .any(|r| r.interfaces.iter().any(|i| i == ap_want))
-                {
-                    return Err(format!(
-                        "ap.interface {ap_want:?}: not an AP-capable radio \
-                         distinct from ap.uplink {want:?}"
-                    ));
-                }
-                ap_want.to_string()
-            }
-            None => candidates
-                .iter()
-                .find_map(|r| r.interfaces.first().cloned())
-                .ok_or(
-                    "dual-radio needs a second AP-capable radio for the \
-                     hotspot; ap.uplink names the uplink side",
-                )?,
-        };
-        return Ok(Plan {
-            mode: "dual-radio".to_string(),
-            ap_iface,
-            uplink: Some(want.to_string()),
-            gateway: cfg.gateway,
-            station_channel: None,
-        });
-    }
-    let station_radio = report
-        .radios
-        .iter()
-        .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
-        .find(|r| r.interfaces.iter().any(|i| default_routes.contains(i)))
-        .or_else(|| {
-            // No default-route station: tolerate exactly one connected
-            // station, since the operator may route manually.
-            let connected: Vec<&doctor::Radio> = report
-                .radios
-                .iter()
-                .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
-                .collect();
-            (connected.len() == 1).then(|| connected[0])
-        })
-        .ok_or(
-            "dual-radio needs exactly one connected wifi station carrying the \
-             default route as its uplink (connect to wifi first)",
-        )?;
-    let uplink = station_radio
-        .interfaces
-        .iter()
-        .find(|i| default_routes.contains(*i))
-        .or_else(|| station_radio.interfaces.first())
-        .ok_or("the uplinking radio has no interface")?
-        .clone();
-
-    // Exactly one station may own the default route; another associated
-    // station would compete for it (NetworkManager may switch at will).
-    let stray_stations: Vec<&String> = report
-        .radios
-        .iter()
-        .filter(|r| r.phy != station_radio.phy)
-        .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
-        .flat_map(|r| r.interfaces.iter())
-        .collect();
-    if !stray_stations.is_empty() {
-        return Err(format!(
-            "more than one wifi station is connected ({}); disconnect {} first \
-             so the uplink is unambiguous",
-            uplink,
-            stray_stations
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    // Candidate AP radios: AP-capable, on a different phy than the uplink.
+/// Pick the beaconing interface: the configured `ap.interface` if it is
+/// AP-capable on a radio that is neither the uplink nor another live
+/// station, else the first such interface.
+fn pick_ap_radio(
+    report: &doctor::Report,
+    cfg: &Config,
+    exclude_phy: &str,
+) -> Result<String, String> {
+    let is_free = |r: &doctor::Radio| {
+        r.phy != exclude_phy && !r.station.as_ref().is_some_and(|s| s.connected)
+    };
     let candidates: Vec<&doctor::Radio> = report
         .radios
         .iter()
-        .filter(|r| r.supports_ap && r.phy != station_radio.phy)
+        .filter(|r| r.supports_ap && is_free(r))
         .collect();
-    let ap_iface = match cfg.ap.interface.as_deref() {
+    match cfg.ap.interface.as_deref() {
         Some(want) => {
             let usable = candidates
                 .iter()
                 .any(|r| r.interfaces.iter().any(|i| i == want));
             if !usable {
                 return Err(format!(
-                    "ap.interface {want:?}: not an AP-capable radio distinct \
-                     from the uplink radio (`piso-hotspot doctor` lists candidates)"
+                    "ap.interface {want:?}: not an AP-capable radio free of the \
+                     uplink and other stations (`piso-hotspot doctor` lists candidates)"
                 ));
             }
-            want.to_string()
+            Ok(want.to_string())
         }
         None => candidates
             .iter()
             .find_map(|r| r.interfaces.first().cloned())
-            .ok_or(
-                "dual-radio needs a second AP-capable radio; only the uplinking \
-                 radio is present",
-            )?,
-    };
+            .ok_or_else(|| {
+                "no radio available to beacon: every other AP-capable radio is \
+                 busy as a station"
+                    .to_string()
+            }),
+    }
+}
+
+/// `--dual-radio`: internet arrives over one radio as a station while a
+/// second radio beacons the AP. Both radios stay in their natural mode,
+/// so no driver concurrency is needed — just two radios.
+fn dual_radio_plan(report: &doctor::Report, cfg: &Config) -> Result<Plan, String> {
+    let default_routes = doctor::default_route_ifaces();
+    dual_radio_plan_with_routes(report, cfg, &default_routes)
+}
+
+/// Route table injected: the pure decision, exercisable in tests.
+fn dual_radio_plan_with_routes(
+    report: &doctor::Report,
+    cfg: &Config,
+    default_routes: &std::collections::BTreeSet<String>,
+) -> Result<Plan, String> {
+    // An explicit `ap.uplink` names the internet egress. Warn when the
+    // default route points elsewhere: NAT is pinned to that interface,
+    // so client traffic would otherwise leave unmasked on another link.
+    if let Some(want) = cfg.ap.uplink.as_deref() {
+        let radio = report
+            .radios
+            .iter()
+            .find(|r| r.interfaces.iter().any(|i| i == want))
+            .ok_or_else(|| format!("ap.uplink {want:?}: no such wifi interface"))?;
+        if !default_routes.contains(want) {
+            eprintln!(
+                "daemon: warning: ap.uplink {want} does not hold the default route; \
+                 client traffic only follows it if a route says so"
+            );
+        }
+        return Ok(Plan {
+            mode: "dual-radio".to_string(),
+            ap_iface: pick_ap_radio(report, cfg, &radio.phy)?,
+            uplink: Some(want.to_string()),
+            gateway: cfg.gateway,
+            station_channel: None,
+        });
+    }
+
+    // Auto-selection: the uplink must be the station actually carrying
+    // internet (default route), never merely "some connected station".
+    let station_radio = report
+        .radios
+        .iter()
+        .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
+        .find(|r| r.interfaces.iter().any(|i| default_routes.contains(i)))
+        .ok_or_else(|| {
+            let roaming: Vec<&str> = report
+                .radios
+                .iter()
+                .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
+                .filter_map(|r| r.interfaces.first().map(String::as_str))
+                .collect();
+            match roaming.as_slice() {
+                [] => "dual-radio needs a connected wifi station as its uplink \
+                       (connect to wifi first)"
+                    .to_string(),
+                stations => format!(
+                    "connected station(s) {} do not hold the default route; set \
+                     ap.uplink to choose one explicitly",
+                    stations.join(", ")
+                ),
+            }
+        })?;
+    let uplink = station_radio
+        .interfaces
+        .iter()
+        .find(|i| default_routes.contains(*i))
+        .expect("station_radio was selected by this test")
+        .clone();
+
+    // A second associated station would let NetworkManager move the
+    // default route mid-sale; only the chosen uplink may be connected.
+    let stray: Vec<&String> = report
+        .radios
+        .iter()
+        .filter(|r| r.phy != station_radio.phy)
+        .filter(|r| r.station.as_ref().is_some_and(|s| s.connected))
+        .flat_map(|r| r.interfaces.iter())
+        .collect();
+    if !stray.is_empty() {
+        return Err(format!(
+            "more than one wifi station is connected ({}); disconnect {} or set \
+             ap.uplink to choose the uplink explicitly",
+            stray
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            uplink
+        ));
+    }
 
     Ok(Plan {
         mode: "dual-radio".to_string(),
-        ap_iface,
+        ap_iface: pick_ap_radio(report, cfg, &station_radio.phy)?,
         uplink: Some(uplink),
         gateway: cfg.gateway,
         station_channel: None,
@@ -1024,4 +1030,149 @@ fn spawn_child_watch(d: Arc<Mutex<Daemon>>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doctor::{Radio, Station};
+    use std::collections::BTreeSet;
+
+    fn radio(iface: &str, phy: &str, ap: bool, station: Option<&str>) -> Radio {
+        Radio {
+            interfaces: vec![iface.to_string()],
+            phy: phy.to_string(),
+            driver: None,
+            bands: vec!["2.4".to_string()],
+            supports_ap: ap,
+            concurrent_ap_sta: false,
+            concurrent_shares_channel: false,
+            station: station.map(|ssid| Station {
+                connected: true,
+                ssid: Some(ssid.to_string()),
+                channel: Some(6),
+            }),
+        }
+    }
+
+    fn report(radios: Vec<Radio>) -> doctor::Report {
+        doctor::Report {
+            host: doctor::Host {
+                hostname: "test".into(),
+                kernel: "test".into(),
+                is_root: true,
+            },
+            dependencies: vec![],
+            radios,
+            uplinks: vec![],
+            modes: vec![],
+            state: doctor::State {
+                config_path: "/dev/null".into(),
+                config_exists: false,
+                state_path: "/dev/null".into(),
+                state_exists: false,
+                schema_version: None,
+            },
+            ok: true,
+        }
+    }
+
+    fn routes(ifaces: &[&str]) -> BTreeSet<String> {
+        ifaces.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dual_radio_picks_the_default_route_station_as_uplink() {
+        let r = report(vec![
+            radio("wlan0", "phy0", true, Some("home")),
+            radio("wlan1", "phy1", true, None),
+        ]);
+        let plan =
+            dual_radio_plan_with_routes(&report_clone(&r), &Config::default(), &routes(&["wlan0"]))
+                .expect("plan");
+        assert_eq!(plan.mode, "dual-radio");
+        assert_eq!(plan.uplink.as_deref(), Some("wlan0"));
+        assert_eq!(plan.ap_iface, "wlan1");
+    }
+
+    #[test]
+    fn dual_radio_refuses_two_connected_stations_without_an_explicit_uplink() {
+        let r = report(vec![
+            radio("wlan0", "phy0", true, Some("home")),
+            radio("wlan1", "phy1", true, Some("other")),
+            radio("wlan2", "phy2", true, None),
+        ]);
+        let err =
+            dual_radio_plan_with_routes(&r, &Config::default(), &routes(&["wlan0"])).unwrap_err();
+        assert!(err.contains("more than one wifi station"), "{err}");
+    }
+
+    #[test]
+    fn dual_radio_explicit_uplink_wins_over_ambiguity() {
+        let mut cfg = Config::default();
+        cfg.ap.uplink = Some("wlan1".into());
+        let r = report(vec![
+            radio("wlan0", "phy0", true, Some("home")),
+            radio("wlan1", "phy1", true, Some("other")),
+            radio("wlan2", "phy2", true, None),
+        ]);
+        // No default-route entry needed: explicit choice is authoritative.
+        let plan = dual_radio_plan_with_routes(&r, &cfg, &routes(&[])).expect("plan");
+        assert_eq!(plan.uplink.as_deref(), Some("wlan1"));
+        assert_eq!(plan.ap_iface, "wlan2");
+    }
+
+    #[test]
+    fn dual_radio_never_beacons_on_the_uplink_radio() {
+        let mut cfg = Config::default();
+        cfg.ap.interface = Some("wlan0".into()); // same phy as the uplink
+        let r = report(vec![
+            radio("wlan0", "phy0", true, Some("home")),
+            radio("wlan1", "phy1", true, None),
+        ]);
+        let err = dual_radio_plan_with_routes(&r, &cfg, &routes(&["wlan0"])).unwrap_err();
+        assert!(err.contains("not an AP-capable radio free of"), "{err}");
+    }
+
+    #[test]
+    fn dual_radio_needs_a_second_radio() {
+        let r = report(vec![radio("wlan0", "phy0", true, Some("home"))]);
+        let err =
+            dual_radio_plan_with_routes(&r, &Config::default(), &routes(&["wlan0"])).unwrap_err();
+        assert!(err.contains("no radio available to beacon"), "{err}");
+    }
+
+    #[test]
+    fn dual_radio_without_a_default_route_names_the_station() {
+        let r = report(vec![
+            radio("wlan0", "phy0", true, Some("home")),
+            radio("wlan1", "phy1", true, None),
+        ]);
+        let err = dual_radio_plan_with_routes(&r, &Config::default(), &routes(&[])).unwrap_err();
+        assert!(err.contains("do not hold the default route"), "{err}");
+        assert!(err.contains("ap.uplink"), "{err}");
+    }
+
+    fn report_clone(r: &doctor::Report) -> doctor::Report {
+        // Report owns no interior state worth deep-copying; rebuild it.
+        report(
+            r.radios
+                .iter()
+                .map(|x| Radio {
+                    interfaces: x.interfaces.clone(),
+                    phy: x.phy.clone(),
+                    driver: x.driver.clone(),
+                    bands: x.bands.clone(),
+                    supports_ap: x.supports_ap,
+                    concurrent_ap_sta: x.concurrent_ap_sta,
+                    concurrent_shares_channel: x.concurrent_shares_channel,
+                    station: x.station.as_ref().map(|s| Station {
+                        connected: s.connected,
+                        ssid: s.ssid.clone(),
+                        channel: s.channel,
+                    }),
+                })
+                .collect(),
+        )
+    }
 }

@@ -1,16 +1,14 @@
 //! Virtual access-point interfaces (`ap0`) beside a station interface.
 //!
-//! This is the `--wifi-uplink` primitive: the station keeps its
-//! association and the AP beacons beside it on the same radio — which
-//! only works when the driver advertises a station+AP interface
-//! combination (`piso-hotspot doctor` says so).
+//! The `--wifi-uplink` primitive: the station keeps its association and
+//! the AP beacons beside it on the same radio, which requires a driver
+//! station+AP interface combination (`piso-hotspot doctor` reports it).
 //!
-//! Learned the hard way by the prototype this replaces:
-//! - a freshly created virtual interface can briefly borrow the
-//!   station's MAC; hostapd with a duplicate MAC misbehaves, so we
-//!   wait until the kernel assigns a distinct one;
-//! - `iw dev … interface add` can exit 0 having changed nothing, so the
-//!   interface type is read back rather than trusted.
+//! Two kernel quirks shape the implementation:
+//! - a new virtual interface can briefly borrow the station's MAC, and
+//!   hostapd misbehaves on a duplicate, so wait for a distinct one;
+//! - `iw dev … interface add` exits 0 even when it changed nothing, so
+//!   read the interface type back instead of trusting the exit code.
 
 use std::fs;
 use std::path::Path;

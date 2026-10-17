@@ -45,6 +45,7 @@ pub enum NftError {
 fn validate_iface(name: &str) -> Result<&str, NftError> {
     let ok = !name.is_empty()
         && name.len() <= 15
+        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));

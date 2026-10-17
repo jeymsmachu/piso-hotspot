@@ -1,11 +1,11 @@
-//! The daemon's HTTP surface: admin panel API and (later) captive portal.
+//! Admin panel HTTP surface.
 //!
-//! One axum server on a dedicated thread/runtime inside the daemon —
-//! the rest of the daemon keeps its plain std threads. The shared
-//! `Daemon` mutex guards every request; handlers hold it only for
-//! quick store/firewall operations, so a panel request never stalls
-//! anything for more than a few milliseconds, and *nothing* runs when
-//! no browser is open.
+//! An axum server on a dedicated thread inside the daemon; the rest of
+//! the daemon stays on plain std threads. Handlers hold the shared
+//! `Daemon` mutex only for quick store/firewall work, so a panel request
+//! never stalls enforcement, and nothing runs when no browser is open.
+//!
+//! The captive portal is a separate server — see [`crate::portal`].
 
 use std::sync::{Arc, Mutex};
 
