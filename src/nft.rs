@@ -132,6 +132,23 @@ impl Firewall {
                 subnet = self.client_subnet()
             ));
         }
+        if self.portal_enabled {
+            // Captive portal. Unpaid clients resolve DNS normally (the
+            // answers are useless to them anyway — their HTTP gets
+            // rerouted here, before the forward chain ever sees it).
+            // Paying clients and friends skip the redirect entirely.
+            out.push_str(&format!(
+                "
+    chain prerouting {{
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname != \"{ap}\" accept
+        tcp dport 80 ether saddr @{SET_FRIENDS} accept
+        tcp dport 80 ether saddr @{SET_ALLOWED} accept
+        tcp dport 80 redirect to :80
+    }}
+"
+            ));
+        }
         out.push_str("}\n");
         out
     }
@@ -322,6 +339,31 @@ mod tests {
         let input = rules.split("chain input").nth(1).expect("input chain");
         assert!(input.contains("tcp dport 80 accept"), "{input}");
         assert!(!input.contains("{ 80"), "80 must appear once: {input}");
+    }
+
+    #[test]
+    fn portal_redirect_intercepts_unpaid_http_only() {
+        let rules = fw(None).render();
+        let pre = rules
+            .split("chain prerouting")
+            .nth(1)
+            .expect("prerouting chain present");
+        // Paid and friends pass before the catch-all redirect fires.
+        let allowed_at = pre.find("@allowed accept").expect("allowed bypass");
+        let friends_at = pre.find("@friends accept").expect("friends bypass");
+        let redirect_at = pre.find("redirect to :80").expect("redirect");
+        assert!(friends_at < allowed_at && allowed_at < redirect_at, "{pre}");
+        // The chain only fires for the AP side.
+        assert!(pre.contains("iifname != \"wlan0\" accept"), "{pre}");
+    }
+
+    #[test]
+    fn no_redirect_chain_when_portal_disabled() {
+        let mut f = fw(None);
+        f.portal_enabled = false;
+        let rules = f.render();
+        assert!(!rules.contains("prerouting"), "{rules}");
+        assert!(!rules.contains("redirect"), "{rules}");
     }
 
     #[test]

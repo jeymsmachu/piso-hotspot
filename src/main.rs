@@ -12,6 +12,7 @@ mod mac;
 mod nft;
 mod passes;
 mod paywall;
+mod portal;
 mod radio;
 mod store;
 mod viface;

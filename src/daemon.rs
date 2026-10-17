@@ -348,6 +348,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     eprintln!("daemon: up; panel: {:?}", daemon.panel_urls);
 
     let port = daemon.cfg.ap.port;
+    let (portal_enabled, portal_gateway) = (daemon.cfg.portal.enabled, daemon.fw.gateway);
     let daemon = Arc::new(Mutex::new(daemon));
     serve(Arc::clone(&daemon));
     spawn_reconciler(Arc::clone(&daemon));
@@ -358,6 +359,15 @@ fn run_inner(opts: Opts) -> Result<(), String> {
             if let Err(e) = crate::http::spawn_panel(panel_state, port) {
                 // The paywall and CLI keep working without the panel.
                 eprintln!("piso-hotspot daemon: panel unavailable: {e}");
+            }
+        });
+    }
+    if portal_enabled {
+        let portal_state = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            if let Err(e) = crate::portal::spawn(portal_state, portal_gateway) {
+                // Clients still get internet; they just get no notice page.
+                eprintln!("piso-hotspot daemon: portal unavailable: {e}");
             }
         });
     }

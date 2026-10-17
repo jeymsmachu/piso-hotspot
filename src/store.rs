@@ -311,6 +311,36 @@ pub fn set_device_label(
     Ok(())
 }
 
+/// One device by MAC, when known to the store.
+pub fn get_device(conn: &Connection, mac: &str) -> Result<Option<DeviceRow>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT mac, label, state, pass_id, expires_at, first_seen, last_seen
+         FROM devices WHERE mac = ?1",
+    )?;
+    let mut rows = stmt.query_map([mac], |r| {
+        Ok(DeviceRow {
+            mac: r.get(0)?,
+            label: r.get(1)?,
+            state: r.get(2)?,
+            pass_id: r.get(3)?,
+            expires_at: r.get(4)?,
+            first_seen: r.get(5)?,
+            last_seen: r.get(6)?,
+        })
+    })?;
+    rows.next().transpose().map_err(Into::into)
+}
+
+/// Is this MAC on the friend list?
+pub fn is_friend(conn: &Connection, mac: &str) -> Result<bool, StoreError> {
+    let n: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM friends WHERE mac = ?1)",
+        [mac],
+        |r| r.get(0),
+    )?;
+    Ok(n == 1)
+}
+
 /// Revenue since `since` (unix ts): total in the minor unit and count.
 pub fn revenue_since(conn: &Connection, since: i64) -> Result<(i64, i64), StoreError> {
     conn.query_row(
