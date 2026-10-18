@@ -8,7 +8,6 @@ updates:
     groups:
       cargo-low-risk:
         update-types:
-          - minor
           - patch
     labels:
       - dependencies
