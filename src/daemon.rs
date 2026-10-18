@@ -988,7 +988,9 @@ fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
                 Err(e) => eprintln!("reconcile failed: {e}"),
             }
             for lease in leases::read(Path::new(wireless::LEASE_FILE)) {
-                if let Err(e) = store::touch_leased_device(&d.conn, &lease.mac, now_ts) {
+                if let Err(e) =
+                    store::touch_leased_device(&d.conn, &lease.mac, Some(&lease.ip), now_ts)
+                {
                     eprintln!("lease touch failed: {e}");
                 }
             }
