@@ -53,6 +53,11 @@ jobs:
             appimage_arch: aarch64
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container || null }}
+    # The arm job runs in a container whose default shell is dash; the
+    # AppImage step needs bash (set -o pipefail).
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install build tools (container image)
         if: matrix.container != ''
