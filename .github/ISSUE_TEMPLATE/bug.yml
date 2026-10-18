@@ -39,5 +39,5 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: `piso-hotspot doctor` output
+      label: "`piso-hotspot doctor` output"
       description: Run `piso-hotspot doctor` and paste the result. Leave empty if unavailable.
