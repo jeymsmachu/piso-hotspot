@@ -7,16 +7,16 @@
 //! unpaid HTTP here — DNS is never tampered with.
 
 use std::net::Ipv4Addr;
-use std::path::Path;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 
 use crate::http::Shared;
 use crate::store;
-use crate::{leases, wireless};
+use crate::{log_info, neigh};
 
 const TEMPLATE: &str = include_str!("../web/portal/portal.html");
 const CSS: &str = include_str!("../web/portal/portal.css");
@@ -251,6 +251,7 @@ pub fn spawn(state: Shared, gateway: Ipv4Addr) -> Result<(), String> {
             .await
             .map_err(|e| format!("cannot bind portal on {gateway}:80: {e}"))?;
         let router = Router::new()
+            .route("/portal", get(page))
             .route("/portal.css", get(css))
             .route("/assets/offline-sprite-1x.png", get(sprite_1x))
             .route("/assets/offline-sprite-2x.png", get(sprite_2x))
@@ -277,36 +278,73 @@ async fn sprite_2x() -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "image/png")], SPRITE_2X)
 }
 
-/// Any path: the client's state page (this includes OS connectivity
-/// probes — answering them with the portal is what triggers the
-/// native "sign in to network" sheet).
+/// Paths that are the portal itself: those render the page instead of
+/// bouncing the visitor to it.
+fn is_portal_path(path: &str) -> bool {
+    matches!(path, "/" | "/portal") || path.starts_with("/portal.") || path.starts_with("/assets/")
+}
+
+/// A redirect, which is the answer an operating system reads as
+/// "captive": no caching, and no page in the place of what was asked for.
+fn redirect_to(url: &str) -> Response {
+    let mut response = (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// The page itself: never cached, so an expired pass cannot keep showing
+/// a paid page out of the browser's cache.
+fn page_response(html: String) -> Response {
+    let mut response = Html(html).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Any path: the client's state page.
+///
+/// Unpaid visitors are *redirected* to the page rather than handed it in
+/// place of whatever they asked for. That distinction is what makes an
+/// operating system offer "sign in to this network" again after a pass
+/// expires: captive-portal probes are matched against the answer they
+/// expect, and a redirect is the answer that means "captive" — a 200
+/// carrying somebody else's page means "online", and the notice never
+/// comes back (#25).
 async fn page(
     State(state): State<Shared>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    uri: Uri,
 ) -> Response {
     let now = crate::daemon::now();
-    let ip = addr.ip().to_string();
+    let ip = addr.ip();
 
-    let data = {
+    // Who is asking: the kernel's neighbour table, not the DHCP lease
+    // file, so a device that took somebody else's address is described as
+    // itself (#22). A v6 or malformed source simply has no entry.
+    let device_mac = match ip {
+        std::net::IpAddr::V4(v4) => neigh::holder(v4).map(|mac| mac.to_string()),
+        std::net::IpAddr::V6(_) => None,
+    };
+
+    let (data, gateway, unpaid) = {
         let d = match state.lock() {
             Ok(d) => d,
             Err(_) => {
                 return Html("<h1>temporarily unavailable</h1>").into_response();
             }
         };
-        let lease_mac = leases::read(Path::new(wireless::LEASE_FILE))
-            .into_iter()
-            .find(|l| l.ip == ip)
-            .map(|l| l.mac.to_string());
 
-        let kind = match &lease_mac {
+        let kind = match &device_mac {
             None => PortalKind::Unpaid { mac: None },
             Some(mac) => {
                 let is_friend = store::is_friend(&d.conn, mac).unwrap_or(false);
                 let device = store::get_device(&d.conn, mac).ok().flatten();
                 if is_friend {
                     PortalKind::Friend {
-                        mac: lease_mac.clone(),
+                        mac: Some(mac.clone()),
                     }
                 } else if let Some(dev) = device
                     && dev.state == "paid"
@@ -327,13 +365,14 @@ async fn page(
                     }
                 } else {
                     PortalKind::Unpaid {
-                        mac: lease_mac.clone(),
+                        mac: Some(mac.clone()),
                     }
                 }
             }
         };
+        let unpaid = matches!(kind, PortalKind::Unpaid { .. });
 
-        PortalData {
+        let data = PortalData {
             title: d.cfg.blocked_page.title.clone(),
             message: d.cfg.blocked_page.message.clone(),
             footnote: d.cfg.blocked_page.footer.clone(),
@@ -347,19 +386,25 @@ async fn page(
             },
             kind,
             now,
-        }
+        };
+        (data, d.fw.gateway, unpaid)
     };
 
-    eprintln!(
-        "portal hit from {ip} ({})",
-        match &data.kind {
-            PortalKind::Unpaid { mac } => format!("unpaid mac={}", mac.as_deref().unwrap_or("?")),
-            PortalKind::Paid { mac, .. } => format!("PAID mac={mac}"),
-            PortalKind::Friend { mac } => format!("friend mac={}", mac.as_deref().unwrap_or("?")),
-        }
-    );
+    let described = match &data.kind {
+        PortalKind::Unpaid { mac } => format!("unpaid mac={}", mac.as_deref().unwrap_or("?")),
+        PortalKind::Paid { mac, .. } => format!("paid mac={mac}"),
+        PortalKind::Friend { mac } => format!("friend mac={}", mac.as_deref().unwrap_or("?")),
+    };
 
-    Html(render(&data)).into_response()
+    if unpaid && !is_portal_path(uri.path()) {
+        // Send them to the page, and say so: this is also the evidence
+        // that a device which was online before is being asked to sign in
+        // again.
+        log_info!("portal redirect from {ip} ({described}) for {}", uri.path());
+        return redirect_to(&format!("http://{gateway}/portal"));
+    }
+    log_info!("portal page for {ip} ({described})");
+    page_response(render(&data))
 }
 
 #[cfg(test)]

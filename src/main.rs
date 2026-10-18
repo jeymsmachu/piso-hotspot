@@ -11,6 +11,7 @@ mod keepalive;
 mod leases;
 mod log;
 mod mac;
+mod neigh;
 mod netns;
 mod nft;
 mod passes;

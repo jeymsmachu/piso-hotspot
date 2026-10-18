@@ -272,6 +272,12 @@ impl Firewall {
         ether saddr @{SET_FRIENDS} counter accept
         ether saddr @{SET_ALLOWED} counter accept
         ether saddr @{SET_BLOCKED} counter drop
+        # HTTPS-first browsers probe :443 before they try :80; a silent
+        # drop leaves them waiting about six seconds per attempt. A
+        # refusal is instant, and it is also what their captive-portal
+        # detection notices (#25).
+        tcp dport 443 counter reject with tcp reset
+        udp dport 443 counter reject
         counter drop
     }}
 
@@ -673,15 +679,16 @@ mod tests {
         assert!(rules.contains("ether saddr @allowed counter accept"));
         assert!(rules.contains("counter drop"));
         // Every policy decision is observable: five set declarations
-        // carry counters, plus seven rule counters (blocked downloads,
-        // allowed downloads, friends, allowed, blocked uploads, forward
-        // drop, input drop). Comment lines are ignored.
+        // carry counters, plus nine rule counters (blocked downloads,
+        // allowed downloads, friends, allowed, blocked uploads, the two
+        // HTTPS refusals, forward drop, input drop). Comments are
+        // ignored.
         let counted = rules
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
             .filter(|l| l.contains("counter"))
             .count();
-        assert_eq!(counted, 12);
+        assert_eq!(counted, 14);
     }
 
     #[test]
@@ -706,6 +713,42 @@ mod tests {
             .expect("drop");
         let gate_at = forward.find("iifname != \"wlan0\" accept").expect("gate");
         assert!(drop_at < gate_at, "{forward}");
+    }
+
+    /// One chain's text, without the chains that follow it.
+    fn chain<'a>(rules: &'a str, name: &str) -> &'a str {
+        let start = rules.find(&format!("chain {name}")).expect("chain present");
+        let rest = &rules[start..];
+        match rest[1..].find("\n    chain ") {
+            Some(offset) => &rest[..offset + 1],
+            None => rest,
+        }
+    }
+
+    #[test]
+    fn unpaid_https_is_refused_instead_of_dropped() {
+        let rules = fw(None).render();
+        let forward = chain(&rules, "forward");
+        let reset_at = forward.find("reject with tcp reset").expect("tcp reset");
+        let quic_at = forward
+            .find("udp dport 443 counter reject")
+            .expect("udp reject");
+        let drop_at = forward
+            .rfind("counter drop")
+            .expect("the catch-all drop is last");
+        assert!(reset_at < drop_at && quic_at < drop_at, "{forward}");
+        // The refusal comes after the allowed sets, so paying clients are
+        // unaffected: their traffic was accepted before this point.
+        let allowed_at = forward
+            .find("ether saddr @allowed counter accept")
+            .expect("allowed");
+        assert!(allowed_at < reset_at, "{forward}");
+        // Refusing is not granting: nothing in this chain may accept
+        // after the refusal, or an unpaid device would get through.
+        assert!(
+            !forward[reset_at..].contains("accept"),
+            "the refusal must not open anything: {forward}"
+        );
     }
 
     #[test]
