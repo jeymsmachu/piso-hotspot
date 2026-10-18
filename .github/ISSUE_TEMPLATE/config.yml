@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/jeymsmachu/piso-hotspot#readme
+    about: README, installation, and configuration docs.
+  - name: Security
+    url: https://github.com/jeymsmachu/piso-hotspot/security/advisories/new
+    about: Report a security issue privately. Do not file a public issue.

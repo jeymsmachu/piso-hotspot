@@ -1,0 +1,20 @@
+name: Question
+description: Ask how something works. This project has no Discussions, so questions live here.
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [README](../..) and [docs](../..) first — most questions
+        are answered there. If yours isn't, ask away.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Distro, adapter, and what you're trying to achieve.

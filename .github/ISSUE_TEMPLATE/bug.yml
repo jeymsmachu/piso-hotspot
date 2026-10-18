@@ -1,0 +1,43 @@
+name: Bug report
+description: Something isn't working.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Your `piso-hotspot doctor` output is the
+        fastest way to triage hardware-related bugs — please include it.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      placeholder: Describe the failure.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: distro + `uname -r`, Wi-Fi adapter chipset/driver, start mode (`--dual-radio` etc.), UFW active?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: `piso-hotspot doctor` output
+      description: Run `piso-hotspot doctor` and paste the result. Leave empty if unavailable.

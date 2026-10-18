@@ -1,0 +1,30 @@
+name: Feature request
+description: A new feature or improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      placeholder: "e.g. 'I want to cap each pass to a data quota'"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      placeholder: Describe the new or changed behavior.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - CLI
+        - Panel
+        - Portal
+        - Paywall / firewall
+        - Packaging / install
+        - docs
+        - Unsure
