@@ -140,7 +140,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
-        conn.pragma_update(None, "user_version", 2)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     Ok(())
 }

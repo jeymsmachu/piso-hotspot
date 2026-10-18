@@ -11,7 +11,7 @@
 //! DHCP does — at no point does a client see working-but-ungated internet.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -30,6 +30,7 @@ use crate::paywall;
 use crate::radio;
 use crate::store;
 use crate::{leases, shaper, ufw, wireless};
+use crate::{log_error, log_info, log_warn};
 
 const PID_FILE: &str = "/run/piso-hotspot/daemon.pid";
 const LOG_FILE: &str = "/run/piso-hotspot/daemon.log";
@@ -97,10 +98,14 @@ pub fn spawn(opts: Opts) -> Result<(), String> {
     fs::create_dir_all("/run/piso-hotspot").map_err(|e| format!("cannot create run dir: {e}"))?;
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
+    // A new run rotates the log instead of truncating it: the previous
+    // run's lines are what an operator needs after a crash (#30).
+    if let Err(e) = crate::log::rotate(Path::new(LOG_FILE)) {
+        eprintln!("piso-hotspot: {e}");
+    }
     let log = fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(LOG_FILE)
         .map_err(|e| format!("cannot open {LOG_FILE}: {e}"))?;
     let err_log = log.try_clone().map_err(|e| e.to_string())?;
@@ -270,7 +275,7 @@ pub fn run(opts: Opts) -> ! {
     if let Err(e) = run_inner(opts) {
         // Never leave a stale pid file behind a failed start.
         let _ = fs::remove_file(PID_FILE);
-        eprintln!("piso-hotspot daemon: {e}");
+        log_error!("exiting: {e}");
         std::process::exit(1);
     }
     std::process::exit(0);
@@ -284,6 +289,9 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         "/run/piso-hotspot",
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     );
+    // From here on, operational messages are timestamped and leveled —
+    // and land in the same file as hostapd's and dnsmasq's output.
+    crate::log::init(Path::new(LOG_FILE));
     if !doctor::is_root() {
         return Err("must run as root".into());
     }
@@ -305,9 +313,12 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     let conn = store::open(&config::state_path()).map_err(|e| e.to_string())?;
 
     let plan = plan(opts, &cfg)?;
-    eprintln!(
-        "daemon: mode={} ap={} uplink={:?} gateway={}",
-        plan.mode, plan.ap_iface, plan.uplink, plan.gateway
+    log_info!(
+        "mode={} ap={} uplink={:?} gateway={}",
+        plan.mode,
+        plan.ap_iface,
+        plan.uplink,
+        plan.gateway
     );
 
     let record = RunningRecord {
@@ -355,7 +366,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     };
 
     if let Err(e) = bring_up(&mut daemon, &plan) {
-        eprintln!("piso-hotspot daemon: bring-up failed: {e}");
+        log_error!("bring-up failed: {e}");
         teardown(&mut daemon);
         return Err(e);
     }
@@ -364,7 +375,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         daemon.cfg.ap.port,
         daemon.fw.uplink.as_deref(),
     );
-    eprintln!("daemon: up; panel: {:?}", daemon.panel_urls);
+    log_info!("hotspot up; panel: {:?}", daemon.panel_urls);
 
     let port = daemon.cfg.ap.port;
     let (portal_enabled, portal_gateway) = (daemon.cfg.portal.enabled, daemon.fw.gateway);
@@ -377,7 +388,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         std::thread::spawn(move || {
             if let Err(e) = crate::http::spawn_panel(panel_state, port) {
                 // The paywall and CLI keep working without the panel.
-                eprintln!("piso-hotspot daemon: panel unavailable: {e}");
+                log_error!("panel unavailable: {e}");
             }
         });
     }
@@ -386,7 +397,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         std::thread::spawn(move || {
             if let Err(e) = crate::portal::spawn(portal_state, portal_gateway) {
                 // Clients still get internet; they just get no notice page.
-                eprintln!("piso-hotspot daemon: portal unavailable: {e}");
+                log_error!("portal unavailable: {e}");
             }
         });
     }
@@ -625,8 +636,8 @@ fn dual_radio_plan_with_routes(
             .find(|r| r.interfaces.iter().any(|i| i == want))
             .ok_or_else(|| format!("ap.uplink {want:?}: no such wifi interface"))?;
         if !default_routes.contains(want) {
-            eprintln!(
-                "daemon: warning: ap.uplink {want} does not hold the default route; \
+            log_warn!(
+                "ap.uplink {want} does not hold the default route; \
                  client traffic only follows it if a route says so"
             );
         }
@@ -782,9 +793,9 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
 
     // Everything is in place: bring the firewall in step with the store.
     match paywall::reconcile(&d.conn, &d.fw, now()) {
-        Ok(r) if r.changed() => eprintln!("daemon: initial reconcile: {r:?}"),
+        Ok(r) if r.changed() => log_info!("initial reconcile: {r:?}"),
         Ok(_) => {}
-        Err(e) => eprintln!("daemon: initial reconcile failed: {e}"),
+        Err(e) => log_error!("initial reconcile failed: {e}"),
     }
     Ok(())
 }
@@ -814,7 +825,7 @@ fn teardown(d: &mut Daemon) {
         if let Some(mut c) = child.take() {
             let _ = c.kill();
             let _ = c.wait();
-            eprintln!("daemon: stopped {name}");
+            log_info!("stopped {name}");
         }
     }
     let _ = d.fw.uninstall();
@@ -842,7 +853,7 @@ fn teardown(d: &mut Daemon) {
     ] {
         let _ = fs::remove_file(file);
     }
-    eprintln!("daemon: teardown complete");
+    log_info!("teardown complete");
 }
 
 // --------------------------------------------------------------- serving
@@ -852,7 +863,7 @@ fn serve(d: Arc<Mutex<Daemon>>) {
         let listener = match control::bind() {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("daemon: control socket: {e}");
+                log_error!("control socket: {e}");
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 return;
             }
@@ -868,7 +879,9 @@ fn serve(d: Arc<Mutex<Daemon>>) {
 }
 
 fn handle(d: &Arc<Mutex<Daemon>>, stream: std::os::unix::net::UnixStream) {
-    let mut reader = BufReader::new(stream);
+    // A request is one small JSON line; cap what we are willing to
+    // buffer for it so a stuck client cannot grow the daemon's memory.
+    let mut reader = BufReader::new(stream.take(MAX_CONTROL_REQUEST));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
@@ -877,38 +890,39 @@ fn handle(d: &Arc<Mutex<Daemon>>, stream: std::os::unix::net::UnixStream) {
         Err(e) => Response::err(format!("bad request: {e}")),
         Ok(req) => dispatch(d, req),
     };
-    let mut stream = reader.into_inner();
+    let mut stream = reader.into_inner().into_inner();
     if let Ok(mut text) = serde_json::to_string(&response) {
         text.push('\n');
         let _ = stream.write_all(text.as_bytes());
     }
 }
 
+/// Largest control-socket request we will read (the socket is root-only;
+/// this is a guard against a buggy caller, not against an attacker).
+const MAX_CONTROL_REQUEST: u64 = 64 * 1024;
+
 pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
+    dispatch_actor(d, req, "cli")
+}
+
+/// Dispatch a request, attributing it to `actor` in the audit trail.
+///
+/// The root socket reports as `cli`; the panel reports as
+/// `panel:<address>`. Every action that changes who has internet is
+/// recorded *and* logged before the response is built, so the record
+/// exists even if the caller never sees the answer. Failures change
+/// nothing, so they are not recorded — but they are logged.
+pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) -> Response {
     let result = (|| -> Result<Response, String> {
         let d = d.lock().map_err(|_| "state poisoned".to_string())?;
+        let now_ts = now();
         match req {
-            Request::Status => {
-                let now_ts = now();
-                Ok(Response {
-                    ok: true,
-                    error: None,
-                    expires_at: None,
-                    status: Some(StatusInfo {
-                        mode: d.mode.clone(),
-                        ap_iface: d.fw.ap_iface.clone(),
-                        uplink: d.fw.uplink.clone(),
-                        gateway: d.fw.gateway.to_string(),
-                        started_at: d.started_at,
-                        devices_seen: store::count_devices(&d.conn).map_err(err_str)?,
-                        active_passes: store::count_active_passes(&d.conn, now_ts)
-                            .map_err(err_str)?,
-                        panel_urls: d.panel_urls.clone(),
-                        admin_passphrase: d.auth.passphrase().to_string(),
-                        sessions: d.auth.session_count(),
-                    }),
-                })
-            }
+            Request::Status => Ok(Response {
+                ok: true,
+                error: None,
+                expires_at: None,
+                status: Some(status_info(&d, now_ts)?),
+            }),
             Request::Grant { mac, pass } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
                 let pass = d
@@ -921,10 +935,23 @@ pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
                         format!("unknown pass {:?}; configured: {}", pass, ids.join(", "))
                     })?
                     .clone();
-                let now_ts = now();
                 let expires =
                     store::grant(&d.conn, &mac, &pass, now_ts, &d.cfg.currency).map_err(err_str)?;
+                store::record_action(
+                    &d.conn,
+                    now_ts,
+                    "grant",
+                    Some(&mac),
+                    Some(&pass.id),
+                    actor,
+                    Some(&format!(
+                        "{} ({} minor) until {expires}",
+                        pass.name, pass.price_minor
+                    )),
+                )
+                .map_err(err_str)?;
                 paywall::apply_device(&d.conn, &d.fw, mac, now_ts).map_err(err_str)?;
+                log_info!("grant {mac} pass={} by {actor} until {expires}", pass.id);
                 Ok(Response {
                     ok: true,
                     error: None,
@@ -934,28 +961,68 @@ pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
             }
             Request::Revoke { mac } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
-                store::revoke(&d.conn, &mac, now()).map_err(err_str)?;
-                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                store::revoke(&d.conn, &mac, now_ts).map_err(err_str)?;
+                store::record_action(&d.conn, now_ts, "revoke", Some(&mac), None, actor, None)
+                    .map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now_ts).map_err(err_str)?;
+                log_info!("revoke {mac} by {actor}");
                 Ok(Response::ok_empty())
             }
             Request::Friend { mac, label } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
-                store::friend(&d.conn, &mac, label.as_deref(), now()).map_err(err_str)?;
-                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                let label = crate::text::clean_label(label.as_deref())?;
+                store::friend(&d.conn, &mac, label.as_deref(), now_ts).map_err(err_str)?;
+                store::record_action(
+                    &d.conn,
+                    now_ts,
+                    "friend",
+                    Some(&mac),
+                    None,
+                    actor,
+                    label.as_deref(),
+                )
+                .map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now_ts).map_err(err_str)?;
+                log_info!(
+                    "friend {mac} label={:?} by {actor} (unlimited, free)",
+                    label.as_deref().unwrap_or("-")
+                );
                 Ok(Response::ok_empty())
             }
             Request::Unfriend { mac } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
                 store::unfriend(&d.conn, &mac).map_err(err_str)?;
-                paywall::apply_device(&d.conn, &d.fw, mac, now()).map_err(err_str)?;
+                store::record_action(&d.conn, now_ts, "unfriend", Some(&mac), None, actor, None)
+                    .map_err(err_str)?;
+                paywall::apply_device(&d.conn, &d.fw, mac, now_ts).map_err(err_str)?;
+                log_info!("unfriend {mac} by {actor}");
                 Ok(Response::ok_empty())
             }
             Request::Rename { mac, label } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
-                store::set_device_label(&d.conn, &mac, label.as_deref(), now()).map_err(err_str)?;
+                let label = crate::text::clean_label(label.as_deref())?;
+                store::set_device_label(&d.conn, &mac, label.as_deref(), now_ts)
+                    .map_err(err_str)?;
+                store::record_action(
+                    &d.conn,
+                    now_ts,
+                    "rename",
+                    Some(&mac),
+                    None,
+                    actor,
+                    label.as_deref(),
+                )
+                .map_err(err_str)?;
+                log_info!(
+                    "rename {mac} to {:?} by {actor}",
+                    label.as_deref().unwrap_or("(cleared)")
+                );
                 Ok(Response::ok_empty())
             }
             Request::Shutdown => {
+                store::record_action(&d.conn, now_ts, "shutdown", None, None, actor, None)
+                    .map_err(err_str)?;
+                log_info!("shutdown requested by {actor}");
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 Ok(Response::ok_empty())
             }
@@ -963,8 +1030,28 @@ pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
     })();
     match result {
         Ok(resp) => resp,
-        Err(e) => Response::err(e),
+        Err(e) => {
+            log_warn!("request refused: {e}");
+            Response::err(e)
+        }
     }
+}
+
+/// The snapshot `status` and the panel report. Kept in one place so both
+/// lanes answer the same way.
+fn status_info(d: &Daemon, now_ts: i64) -> Result<StatusInfo, String> {
+    Ok(StatusInfo {
+        mode: d.mode.clone(),
+        ap_iface: d.fw.ap_iface.clone(),
+        uplink: d.fw.uplink.clone(),
+        gateway: d.fw.gateway.to_string(),
+        started_at: d.started_at,
+        devices_seen: store::count_devices(&d.conn).map_err(err_str)?,
+        active_passes: store::count_active_passes(&d.conn, now_ts).map_err(err_str)?,
+        panel_urls: d.panel_urls.clone(),
+        admin_passphrase: d.auth.passphrase().to_string(),
+        sessions: d.auth.session_count(),
+    })
 }
 
 fn err_str(e: impl std::fmt::Display) -> String {
@@ -983,16 +1070,27 @@ fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
             let Ok(d) = d.lock() else { return };
             let now_ts = now();
             match paywall::reconcile(&d.conn, &d.fw, now_ts) {
-                Ok(r) if r.changed() => eprintln!("reconcile: {r:?}"),
+                Ok(r) if r.changed() => log_info!("reconcile: {r:?}"),
                 Ok(_) => {}
-                Err(e) => eprintln!("reconcile failed: {e}"),
+                Err(e) => log_error!("reconcile failed: {e}"),
             }
             for lease in leases::read(Path::new(wireless::LEASE_FILE)) {
                 if let Err(e) =
                     store::touch_leased_device(&d.conn, &lease.mac, Some(&lease.ip), now_ts)
                 {
-                    eprintln!("lease touch failed: {e}");
+                    log_warn!("lease touch failed: {e}");
                 }
+            }
+            // Retention: forget strangers, keep payers and friends, and
+            // let the next tick sync the firewall sets accordingly.
+            let retention = i64::from(d.cfg.retention_days) * 86_400;
+            match store::prune_devices(&d.conn, now_ts, retention) {
+                Ok(0) => {}
+                Ok(n) => log_info!(
+                    "retention: forgot {n} device(s) not seen in {}d",
+                    d.cfg.retention_days
+                ),
+                Err(e) => log_warn!("prune failed: {e}"),
             }
         }
     });
@@ -1071,10 +1169,12 @@ mod tests {
             state: doctor::State {
                 config_path: "/dev/null".into(),
                 config_exists: false,
+                config_error: None,
                 state_path: "/dev/null".into(),
                 state_exists: false,
                 schema_version: None,
             },
+            conflicts: vec![],
             ok: true,
         }
     }
@@ -1176,5 +1276,99 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// A daemon state good enough to exercise `dispatch` without a radio:
+    /// temp database, default config, and a firewall that is never asked
+    /// to run anything.
+    fn offline_daemon(name: &str) -> Arc<Mutex<Daemon>> {
+        let dir = std::env::temp_dir().join(format!("piso-dispatch-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::store::open(&dir.join("state.db")).unwrap();
+        Arc::new(Mutex::new(Daemon {
+            cfg: Config::default(),
+            conn,
+            fw: Firewall {
+                ap_iface: "wlan0".into(),
+                uplink: None,
+                gateway: Ipv4Addr::new(10, 10, 0, 1),
+                panel_port: 8080,
+                portal_enabled: true,
+            },
+            mode: "offline".into(),
+            started_at: 0,
+            auth: crate::auth::AuthState::new("test-passphrase".into()),
+            panel_urls: Vec::new(),
+            passphrase_generated: true,
+            ip_forward_prev: None,
+            hostapd: None,
+            dnsmasq: None,
+        }))
+    }
+
+    #[test]
+    fn labels_are_validated_where_both_lanes_meet() {
+        let d = offline_daemon("labels");
+        let mac = "aa:bb:cc:dd:ee:ff".to_string();
+
+        // Blank means "clear", and normal labels are stored trimmed.
+        let resp = dispatch(
+            &d,
+            Request::Rename {
+                mac: mac.clone(),
+                label: Some("  Juan's laptop  ".into()),
+            },
+        );
+        assert!(resp.ok, "{:?}", resp.error);
+        let stored: Option<String> = d
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT label FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("Juan's laptop"));
+        assert!(
+            dispatch(
+                &d,
+                Request::Rename {
+                    mac: mac.clone(),
+                    label: Some("  ".into())
+                }
+            )
+            .ok
+        );
+        let stored: Option<String> = d
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT label FROM devices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None, "blank clears the label");
+
+        // Oversized and control-character labels are refused, not stored.
+        let too_long = "a".repeat(crate::text::MAX_LABEL_CHARS + 1);
+        for bad in [too_long, "evil\nlabel".into(), "\u{1b}[2Jpwned".into()] {
+            let resp = dispatch(
+                &d,
+                Request::Friend {
+                    mac: mac.clone(),
+                    label: Some(bad.clone()),
+                },
+            );
+            assert!(!resp.ok, "{bad:?} must be refused");
+            let err = resp.error.unwrap_or_default();
+            assert!(
+                err.contains("at most 50 characters") || err.contains("control characters"),
+                "{err}"
+            );
+        }
+        let friends: i64 = d
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM friends", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(friends, 0, "nothing was stored");
     }
 }

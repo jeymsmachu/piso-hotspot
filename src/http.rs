@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +20,7 @@ use serde_json::json;
 use crate::auth::{LoginError, SESSION_IDLE};
 use crate::control::Request as CtlRequest;
 use crate::daemon::Daemon;
+use crate::{log_info, log_warn};
 
 const SESSION_COOKIE: &str = "piso_session";
 
@@ -57,9 +58,18 @@ fn panel_router(state: Shared) -> Router {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/state", get(state_payload))
+        .route("/api/passphrase", get(passphrase_payload))
         .route("/api/control", post(control))
+        // Every panel request is a small JSON blob; a hard cap means no
+        // request body can be a memory or bandwidth problem, whatever
+        // the client claims its content-length is.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
+
+/// Largest accepted panel request body. The settings form is the big
+/// one, and it is a few hundred bytes.
+const MAX_BODY_BYTES: usize = 16 * 1024;
 
 // ------------------------------------------------------------- static files
 
@@ -145,18 +155,27 @@ async fn login(
         .lock()
         .map(|mut d| d.auth.login(&ip, &body.passphrase));
     match result {
-        Ok(Ok(token)) => (
-            [(header::SET_COOKIE, session_cookie(&token))],
-            Json(json!({ "ok": true })),
-        )
-            .into_response(),
-        Ok(Err(LoginError::BadPassphrase)) => error(StatusCode::UNAUTHORIZED, "wrong passphrase"),
-        Ok(Err(LoginError::LockedOut(secs))) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, secs.to_string())],
-            Json(json!({ "error": format!("too many attempts; try again in {secs}s") })),
-        )
-            .into_response(),
+        Ok(Ok(token)) => {
+            log_info!("panel login ok from {ip}");
+            (
+                [(header::SET_COOKIE, session_cookie(&token))],
+                Json(json!({ "ok": true })),
+            )
+                .into_response()
+        }
+        Ok(Err(LoginError::BadPassphrase)) => {
+            log_warn!("panel login failed from {ip} (wrong passphrase)");
+            error(StatusCode::UNAUTHORIZED, "wrong passphrase")
+        }
+        Ok(Err(LoginError::LockedOut(secs))) => {
+            log_warn!("panel login refused from {ip}: locked out for {secs}s");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                Json(json!({ "error": format!("too many attempts; try again in {secs}s") })),
+            )
+                .into_response()
+        }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "state poisoned"),
     }
 }
@@ -166,6 +185,7 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
         && let Ok(mut d) = state.lock()
     {
         d.auth.logout(token);
+        log_info!("panel logout");
     }
     (
         [(
@@ -233,7 +253,6 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
             "panel_urls": d.panel_urls,
             "sessions": d.auth.session_count(),
             "passphrase_source": if d.passphrase_generated { "generated" } else { "config" },
-            "admin_passphrase": d.auth.passphrase(),
             "version": env!("CARGO_PKG_VERSION"),
         },
         "devices": devices,
@@ -253,15 +272,42 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
+/// The admin passphrase, on demand only.
+///
+/// It is the durable login secret: shipping it in the 3-second state
+/// poll would scatter it through browser history, devtools and any
+/// screenshot of the dashboard. The CLI (`piso-hotspot status`) and an
+/// explicit click here are the only ways to read it back.
+async fn passphrase_payload(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    if let Some(resp) = auth_error(&state, &headers) {
+        return resp;
+    }
+    match state.lock() {
+        Ok(d) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "admin_passphrase": d.auth.passphrase(),
+                "passphrase_source": if d.passphrase_generated { "generated" } else { "config" },
+            })),
+        )
+            .into_response(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "state poisoned"),
+    }
+}
+
 /// The panel's command lane: same protocol as the root-only control
 /// socket, gated by the session instead.
 async fn control(
     State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<CtlRequest>,
 ) -> Response {
     if let Some(resp) = auth_error(&state, &headers) {
         return resp;
     }
-    Json(crate::daemon::dispatch(&state, req)).into_response()
+    // The audit trail names the lane that asked: the root socket is
+    // `cli`, this one carries the address the request came from.
+    let actor = format!("panel:{}", addr.ip());
+    Json(crate::daemon::dispatch_actor(&state, req, &actor)).into_response()
 }

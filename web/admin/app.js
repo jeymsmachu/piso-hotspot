@@ -404,8 +404,7 @@ function settings() {
     h("div", { class: "card" },
       h("h2", {}, "session"),
       h("table", { class: "kv" },
-        kv("passphrase",
-          h("span", { class: "mono" }, s.admin_passphrase),
+        kv("passphrase", revealPass(),
           " ", h("button", { class: "link", onclick: copyPass }, "copy")),
         kv("source", s.passphrase_source),
         kv("active sessions", String(s.sessions)),
@@ -428,10 +427,38 @@ function setTheme(t) {
   render();
 }
 
-function copyPass() {
-  navigator.clipboard?.writeText(S.data.status.admin_passphrase)
-    .then(() => flash("ok", "passphrase copied"))
-    .catch(() => flash("err", "clipboard blocked by browser"));
+/** The passphrase is fetched on demand, never carried in /api/state. */
+let PASS_CACHE = null;
+
+async function fetchPass() {
+  if (PASS_CACHE) return PASS_CACHE;
+  const { res, body } = await api("/api/passphrase");
+  if (!res.ok) throw new Error(body?.error || `request failed (${res.status})`);
+  PASS_CACHE = body.admin_passphrase;
+  return PASS_CACHE;
+}
+
+function revealPass() {
+  const out = h("span", { class: "mono" }, "••••••••");
+  const button = h("button", {
+    class: "link",
+    onclick: async () => {
+      try {
+        out.textContent = await fetchPass();
+        button.remove();
+      } catch (e) { flash("err", String(e.message || e)); }
+    },
+  }, "reveal");
+  return h("span", {}, out, " ", button);
+}
+
+async function copyPass() {
+  try {
+    await navigator.clipboard?.writeText(await fetchPass());
+    flash("ok", "passphrase copied");
+  } catch (e) {
+    flash("err", "clipboard blocked by browser");
+  }
 }
 
 // ------------------------------------------------------------- root render

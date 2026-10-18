@@ -19,6 +19,8 @@ pub struct Report {
     pub uplinks: Vec<Uplink>,
     pub modes: Vec<Mode>,
     pub state: State,
+    /// Ports the hotspot needs that something else already holds.
+    pub conflicts: Vec<String>,
     /// True when at least one real hotspot mode is available.
     pub ok: bool,
 }
@@ -90,6 +92,8 @@ pub struct Mode {
 pub struct State {
     pub config_path: PathBuf,
     pub config_exists: bool,
+    /// `null` when the config loads; otherwise every problem found.
+    pub config_error: Option<String>,
     pub state_path: PathBuf,
     pub state_exists: bool,
     pub schema_version: Option<i64>,
@@ -159,6 +163,11 @@ pub fn inspect() -> Report {
         Some(v) => (true, v),
         None => (false, None),
     };
+    // The config the daemon will actually use: `doctor` must never say
+    // "ok" about a file `start` is going to reject.
+    let config_error = crate::config::Config::load(&config_path)
+        .err()
+        .map(|e| e.to_string());
 
     Report {
         host: Host {
@@ -187,10 +196,12 @@ pub fn inspect() -> Report {
         state: State {
             config_exists: config_path.exists(),
             config_path,
+            config_error,
             state_exists,
             state_path,
             schema_version,
         },
+        conflicts: port_conflicts(),
         ok,
     }
 }
@@ -529,6 +540,9 @@ pub fn print_human(report: &Report) {
             " (not created yet; defaults apply)"
         }
     );
+    if let Some(err) = &report.state.config_error {
+        println!("             INVALID: {err}");
+    }
     println!(
         "  state.db   {}{}",
         report.state.state_path.display(),
@@ -538,11 +552,22 @@ pub fn print_human(report: &Report) {
             (true, None) => " (unreadable)".to_string(),
         }
     );
+    if !report.conflicts.is_empty() {
+        println!();
+        println!("Ports");
+        for conflict in &report.conflicts {
+            println!("  IN USE     {conflict}");
+        }
+    }
     println!();
-    if report.ok {
-        println!("verdict: ok — at least one hotspot mode is available");
-    } else {
+    if !report.ok {
         println!("verdict: no hotspot mode is available (see modes above)");
+    } else if report.state.config_error.is_some() {
+        println!("verdict: the configuration file is invalid (see config above)");
+    } else if !report.conflicts.is_empty() {
+        println!("verdict: usable, but some ports are already taken (see ports above)");
+    } else {
+        println!("verdict: ok — at least one hotspot mode is available");
     }
 }
 
@@ -582,6 +607,71 @@ fn run_ok(program: &std::path::Path, args: &[&str]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// ---------------------------------------------------------- port conflicts
+
+/// Port of a `/proc/net/…` local address field (`"00000000:0035"`).
+fn hex_port(local: &str) -> Option<u16> {
+    let (_, port) = local.split_once(':')?;
+    u16::from_str_radix(port, 16).ok()
+}
+
+/// Bound sockets in a `/proc/net/{tcp,udp}` table. TCP entries are only
+/// counted when they are listening; UDP sockets are bound by definition.
+fn bound_ports(table: &str, proto: &'static str, listening_only: bool) -> Vec<(&'static str, u16)> {
+    let mut out = Vec::new();
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(_sl), Some(local)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let state = fields.nth(1); // skip the remote address
+        if listening_only && state != Some("0A") {
+            continue;
+        }
+        if let Some(port) = hex_port(local) {
+            out.push((proto, port));
+        }
+    }
+    out
+}
+
+/// Ports the hotspot needs that this machine already holds. Another DNS
+/// or DHCP server is the classic "clients get no lease and the log is
+/// silent" mystery; `doctor` is where it should surface, before start.
+fn port_conflicts() -> Vec<String> {
+    // A running daemon owns these ports legitimately.
+    if crate::control::alive() {
+        return Vec::new();
+    }
+    let mut bound = bound_ports(&read_file("/proc/net/udp"), "udp", false);
+    bound.extend(bound_ports(&read_file("/proc/net/tcp"), "tcp", true));
+
+    let panel_port = crate::config::Config::load(&crate::config::config_path())
+        .map(|c| c.ap.port)
+        .unwrap_or(8080);
+    let wanted: [(&str, u16, &str); 4] = [
+        ("udp", 53, "clients need this DNS server"),
+        ("udp", 67, "clients need this DHCP server"),
+        ("tcp", 80, "the captive portal binds this port"),
+        ("tcp", panel_port, "the admin panel binds this port"),
+    ];
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (proto, port, why) in wanted {
+        if bound.contains(&(proto, port)) && seen.insert((proto, port)) {
+            out.push(format!(
+                "{proto} port {port} is already bound ({why}) — \
+                 stop the other server or change the port"
+            ));
+        }
+    }
+    out
+}
+
+fn read_file(path: &str) -> String {
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -850,5 +940,39 @@ mod tests {
                 .detail
                 .contains("interface combinations")
         );
+    }
+
+    #[test]
+    fn proc_net_ports_are_decoded() {
+        // Real /proc/net/udp captures: port 53 bound on the wildcard,
+        // port 5353 on link-local multicast.
+        let udp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   0: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12345 2 0000000000000000 0
+   1: 0100007F:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 54321 2 0000000000000000 0
+";
+        let bound = bound_ports(udp, "udp", false);
+        assert!(bound.contains(&("udp", 53)));
+        assert!(bound.contains(&("udp", 0x14E9)));
+
+        // TCP: only listeners count, not established connections.
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 999 1 0000000000000000 100 0 0 10 0
+   1: 00000000:0050 00000000:0000 01 00000000:00000000 00:00000000 00000000     0        0 998 1 0000000000000000 100 0 0 10 0
+";
+        let bound = bound_ports(tcp, "tcp", true);
+        assert!(bound.contains(&("tcp", 8080)), "{bound:?}");
+        assert!(
+            !bound.iter().any(|(_, port)| *port == 80),
+            "a non-listening entry must not count: {bound:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_proc_lines_are_skipped() {
+        assert!(hex_port("nonsense").is_none());
+        assert!(hex_port("00000000:zz").is_none());
+        assert_eq!(hex_port("00000000:0035"), Some(53));
+        assert!(bound_ports("header only\n", "udp", false).is_empty());
+        assert!(bound_ports("", "udp", false).is_empty());
     }
 }

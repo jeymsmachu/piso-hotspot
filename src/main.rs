@@ -8,6 +8,7 @@ mod doctor;
 mod http;
 mod iwlist;
 mod leases;
+mod log;
 mod mac;
 mod nft;
 mod passes;
@@ -16,6 +17,7 @@ mod portal;
 mod radio;
 mod shaper;
 mod store;
+mod text;
 mod ufw;
 mod viface;
 mod wireless;
@@ -63,6 +65,12 @@ enum Command {
     List,
     /// List friends (unlimited, free access).
     Friends,
+    /// Show recent privileged actions (grants, revokes, friends, logins).
+    Audit {
+        /// How many entries to show.
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+    },
     /// Sell a pass: grant <mac> <quick|extended|...>.
     Grant { mac: String, pass: String },
     /// Cut a device off (keeps its wifi association).
@@ -86,7 +94,7 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Doctor { json } => cmd_doctor(json),
+        Command::Doctor { json } => return cmd_doctor(json),
         Command::Start {
             offline,
             wifi_uplink,
@@ -96,6 +104,7 @@ fn main() -> ExitCode {
         Command::Status => cmd_status(),
         Command::List => cmd_list(),
         Command::Friends => cmd_friends(),
+        Command::Audit { limit } => cmd_audit(limit),
         Command::Grant { mac, pass } => cmd_grant(mac, pass),
         Command::Revoke { mac } => cmd_revoke(mac),
         Command::Friend { mac, label } => cmd_friend(mac, label),
@@ -121,20 +130,28 @@ fn main() -> ExitCode {
 
 type CmdResult = Result<(), String>;
 
-fn cmd_doctor(json: bool) -> CmdResult {
+fn cmd_doctor(json: bool) -> ExitCode {
     let report = doctor::inspect();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("piso-hotspot: cannot render the report: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else {
         doctor::print_human(&report);
     }
+    // 0: usable. 1: this machine cannot run a hotspot. 2: the machine is
+    // fine but config.json is not — scripts can tell the two apart.
     if !report.ok {
-        return Err("no hotspot mode is available (see doctor output)".into());
+        return ExitCode::FAILURE;
     }
-    Ok(())
+    if report.state.config_error.is_some() {
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_start(offline: bool, wifi_uplink: bool, dual_radio: bool) -> CmdResult {
@@ -193,7 +210,10 @@ fn cmd_status() -> CmdResult {
     if s.sessions > 0 {
         println!("  sessions:  {} active", s.sessions);
     }
-    println!("  admin passphrase: {}", s.admin_passphrase);
+    println!(
+        "  admin passphrase: {}",
+        text::sanitize(&s.admin_passphrase)
+    );
     Ok(())
 }
 
@@ -204,18 +224,22 @@ fn cmd_list() -> CmdResult {
         return Ok(());
     }
     println!(
-        "{:<18} {:<12} {:<10} {:<17} LABEL",
-        "MAC", "STATE", "PASS", "EXPIRES"
+        "{:<18} {:<12} {:<10} {:<17} {:<15} LABEL",
+        "MAC", "STATE", "PASS", "EXPIRES", "IP"
     );
     for d in devices {
-        let label = d.label.clone().unwrap_or_default();
+        // Labels are operator-controlled free text: escape before they
+        // reach a terminal (see `text::sanitize`).
+        let label = d.label.as_deref().map(text::sanitize).unwrap_or_default();
         let expires = d.expires_at.map(fmt_ts).unwrap_or_default();
+        let ip = d.ip.clone().unwrap_or_default();
         println!(
-            "{:<18} {:<12} {:<10} {:<17} {}",
+            "{:<18} {:<12} {:<10} {:<17} {:<15} {}",
             d.mac,
             d.state,
             d.pass_id.as_deref().unwrap_or("-"),
             if expires.is_empty() { "-" } else { &expires },
+            if ip.is_empty() { "-" } else { &ip },
             if label.is_empty() { "-" } else { &label }
         );
     }
@@ -230,7 +254,38 @@ fn cmd_friends() -> CmdResult {
     }
     println!("{:<18} LABEL", "MAC");
     for f in friends {
-        println!("{:<18} {}", f.mac, f.label.as_deref().unwrap_or("-"));
+        println!(
+            "{:<18} {}",
+            f.mac,
+            f.label
+                .as_deref()
+                .map(text::sanitize)
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_audit(limit: u32) -> CmdResult {
+    let actions = with_store(|conn| store::recent_actions(conn, limit))?;
+    if actions.is_empty() {
+        println!("no privileged actions recorded yet");
+        return Ok(());
+    }
+    println!(
+        "{:<17} {:<9} {:<18} {:<10} {:<18} DETAIL",
+        "WHEN", "ACTION", "MAC", "PASS", "ACTOR"
+    );
+    for a in actions {
+        println!(
+            "{:<17} {:<9} {:<18} {:<10} {:<18} {}",
+            fmt_ts(a.ts),
+            text::sanitize(&a.action),
+            a.mac.as_deref().unwrap_or("-"),
+            a.pass_id.as_deref().unwrap_or("-"),
+            text::sanitize(&a.actor),
+            a.detail.as_deref().map(text::sanitize).unwrap_or_default()
+        );
     }
     Ok(())
 }

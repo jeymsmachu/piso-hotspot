@@ -63,6 +63,14 @@ pub struct Config {
     pub portal: PortalSettings,
     pub ui: UiSettings,
     pub bandwidth: BandwidthSettings,
+    /// How long to remember devices that never paid and are not friends.
+    /// Sales and audit rows are kept forever.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_retention_days() -> u32 {
+    30
 }
 
 /// Panel login. Empty passphrase = a fresh random one per start,
@@ -164,6 +172,7 @@ impl Default for Config {
             portal: PortalSettings::default(),
             ui: UiSettings::default(),
             bandwidth: BandwidthSettings::default(),
+            retention_days: default_retention_days(),
         }
     }
 }
@@ -324,6 +333,9 @@ impl Config {
             if cap == Some(0) {
                 problems.push(format!("{name}: set null for unlimited, not 0"));
             }
+        }
+        if self.retention_days == 0 {
+            problems.push("retention_days must be at least 1".to_string());
         }
         if self.passes.is_empty() {
             problems.push("at least one pass must be configured".to_string());
