@@ -20,8 +20,6 @@ use crate::{log_info, neigh};
 
 const TEMPLATE: &str = include_str!("../web/portal/portal.html");
 const CSS: &str = include_str!("../web/portal/portal.css");
-const SPRITE_1X: &[u8] = include_bytes!("../web/assets/offline-sprite-1x.png");
-const SPRITE_2X: &[u8] = include_bytes!("../web/assets/offline-sprite-2x.png");
 
 /// One priced line on the unpaid page.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,13 +129,17 @@ pub fn render(data: &PortalData) -> String {
     let (content, script) = match &data.kind {
         PortalKind::Unpaid { mac } => {
             let mut html = format!(
-                "<h1>{}</h1>\n<p class=\"msg\">{}</p>\n<p class=\"device\">device {}</p>\n",
-                escape(&data.title),
-                escape(&data.message),
-                escape(mac.as_deref().unwrap_or("(unknown — rejoin the wifi)")),
+                "<section class=\"card\">\n\
+                   <h1>{title}</h1>\n\
+                   <p class=\"msg\">{message}</p>\n\
+                   <p class=\"device\">this device · {mac}</p>\n\
+                 </section>\n",
+                title = escape(&data.title),
+                message = escape(&data.message),
+                mac = escape(mac.as_deref().unwrap_or("(unknown — rejoin the wifi)")),
             );
             if data.show_prices && !data.prices.is_empty() {
-                html.push_str("<h2>passes</h2>\n<ul class=\"prices\">\n");
+                html.push_str("<section class=\"card\">\n<h2>passes</h2>\n<ul class=\"prices\">\n");
                 for row in &data.prices {
                     html.push_str(&format!(
                         "  <li><span>{} · {}</span><span class=\"p\">{}</span></li>\n",
@@ -146,11 +148,12 @@ pub fn render(data: &PortalData) -> String {
                         escape(&row.price),
                     ));
                 }
-                html.push_str("</ul>\n");
+                html.push_str("</ul>\n</section>\n");
             }
             if !data.payment.trim().is_empty() {
                 html.push_str(&format!(
-                    "<h2>how to pay</h2>\n<div class=\"payment\">{}</div>\n",
+                    "<section class=\"card\">\n<h2>how to pay</h2>\n\
+                     <div class=\"payment\">{}</div>\n</section>\n",
                     escape(&data.payment)
                 ));
             }
@@ -168,15 +171,17 @@ pub fn render(data: &PortalData) -> String {
             expires_at,
         } => {
             let html = format!(
-                "<h1>You're online</h1>\n\
-                 <p class=\"big\"><span id=\"remaining\">{}</span> left</p>\n\
-                 <p class=\"device\">device {}</p>\n\
-                 <p class=\"pass\">{} pass</p>\n\
-                 <p class=\"until\">until {}</p>\n",
-                time_left(*expires_at, data.now),
-                escape(mac),
-                escape(pass_name),
-                hhmm(*expires_at),
+                "<section class=\"card online\">\n\
+                   <h1>You're online</h1>\n\
+                   <p class=\"big\"><span id=\"remaining\">{left}</span> left</p>\n\
+                   <p class=\"pass\">{pass} pass</p>\n\
+                   <p class=\"until\">until {until}</p>\n\
+                   <p class=\"device\">this device · {mac}</p>\n\
+                 </section>\n",
+                left = time_left(*expires_at, data.now),
+                pass = escape(pass_name),
+                until = hhmm(*expires_at),
+                mac = escape(mac),
             );
             // The only script in the portal: one countdown, browser-side,
             // seeded with server time so a wrong phone clock cannot lie.
@@ -207,11 +212,13 @@ pub fn render(data: &PortalData) -> String {
         }
         PortalKind::Friend { mac } => {
             let html = format!(
-                "<h1>You're online</h1>\n\
-                 <p class=\"big\">unlimited</p>\n\
-                 <p class=\"device\">device {}</p>\n\
-                 <p class=\"pass\">friend access</p>\n",
-                escape(mac.as_deref().unwrap_or("(unknown — rejoin the wifi)")),
+                "<section class=\"card online\">\n\
+                   <h1>You're online</h1>\n\
+                   <p class=\"big\">unlimited</p>\n\
+                   <p class=\"pass\">friend access — no pass needed</p>\n\
+                   <p class=\"device\">this device · {mac}</p>\n\
+                 </section>\n",
+                mac = escape(mac.as_deref().unwrap_or("(unknown — rejoin the wifi)")),
             );
             (html, String::new())
         }
@@ -255,6 +262,7 @@ pub fn spawn(state: Shared, gateway: Ipv4Addr) -> Result<(), String> {
             .route("/portal.css", get(css))
             .route("/assets/offline-sprite-1x.png", get(sprite_1x))
             .route("/assets/offline-sprite-2x.png", get(sprite_2x))
+            .route("/assets/press-start-2p.woff2", get(font))
             .fallback(page)
             .with_state(state);
         axum::serve(
@@ -271,11 +279,26 @@ async fn css() -> impl IntoResponse {
 }
 
 async fn sprite_1x() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "image/png")], SPRITE_1X)
+    (
+        [(axum::http::header::CONTENT_TYPE, crate::assets::PNG_TYPE)],
+        crate::assets::SPRITE_1X,
+    )
 }
 
 async fn sprite_2x() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "image/png")], SPRITE_2X)
+    (
+        [(axum::http::header::CONTENT_TYPE, crate::assets::PNG_TYPE)],
+        crate::assets::SPRITE_2X,
+    )
+}
+
+/// The pixel display face, served from the binary: a captive portal has
+/// no internet to fetch fonts from.
+async fn font() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, crate::assets::FONT_TYPE)],
+        crate::assets::FONT_PRESS_START_2P,
+    )
 }
 
 /// Paths that are the portal itself: those render the page instead of
@@ -432,7 +455,6 @@ mod tests {
         let html = render(&unpaid());
         assert!(html.contains("See the operator."));
         assert!(html.contains("42:61:7e:6c:ee:d2"));
-        assert!(html.contains("powered by"));
         assert!(html.contains("github.com/jeymsmachu/piso-hotspot"));
         // The configured title is the document title too.
         assert!(html.contains("<title>No internet yet</title>"));
@@ -477,14 +499,22 @@ mod tests {
         assert!(html.contains(">15m</span> left"), "{html}");
         assert!(html.contains("Quick pass"));
         assert!(html.contains("id=\"remaining\""));
-        // One inline tick, no external requests of any kind.
-        assert_eq!(html.matches("<script>").count(), 1);
+        // The countdown is the only script doing work, it is inline, and
+        // nothing here talks to the network: no external files, no fetch.
+        assert!(html.contains("setInterval"), "the countdown runs locally");
+        assert!(!html.contains("<script src="));
         assert!(!html.contains("fetch("));
     }
 
     #[test]
-    fn unpaid_and_friend_pages_ship_zero_script() {
-        assert!(!render(&unpaid()).contains("<script"));
+    fn unpaid_and_friend_pages_only_carry_the_theme_toggle() {
+        // The theme toggle is the one script on an unpaid page: no
+        // countdown, no timers, nothing that keeps a visitor's browser
+        // talking to the gateway.
+        let html = render(&unpaid());
+        assert!(!html.contains("setInterval"));
+        assert!(!html.contains("remaining"));
+        assert!(!html.contains("<script src="));
         let mut d = unpaid();
         d.kind = PortalKind::Friend {
             mac: Some("42:61:7e:6c:ee:d2".into()),
@@ -492,7 +522,7 @@ mod tests {
         let html = render(&d);
         assert!(html.contains("unlimited"));
         assert!(html.contains("friend access"));
-        assert!(!html.contains("<script"));
+        assert!(!html.contains("setInterval"));
     }
 
     #[test]

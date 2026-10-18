@@ -3,20 +3,43 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#f7f7f7">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f7f7f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#323232" media="(prefers-color-scheme: dark)">
 <title>{{TITLE}}</title>
+<link rel="preload" href="/assets/press-start-2p.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/portal.css">
 </head>
 <body>
-<div class="scene" aria-hidden="true">
+<header class="scene" aria-hidden="true">
   <div class="cloud"></div>
   <div class="dino"></div>
   <div class="ground"></div>
-</div>
-<main>
-{{CONTENT}}
-</main>
-<footer>powered by <a href="https://github.com/jeymsmachu/piso-hotspot">piso-hotspot</a></footer>
+</header>
+<button id="theme-toggle" class="theme-toggle" type="button" aria-label="Change appearance">
+  <span class="theme-auto">◐ auto</span><span class="theme-light">☀ light</span><span class="theme-dark">☾ dark</span>
+</button>
+<main>{{CONTENT}}</main>
+<footer>
+  <a href="https://github.com/jeymsmachu/piso-hotspot">piso-hotspot</a>
+  <span class="muted">— pay-per-usage wifi</span>
+</footer>
+<script>
+(function () {
+  var root = document.documentElement, mode = localStorage.getItem("piso-theme") || "auto";
+  function apply() {
+    if (mode === "auto") { delete root.dataset.theme; } else { root.dataset.theme = mode; }
+  }
+  apply();
+  var button = document.getElementById("theme-toggle");
+  if (!button) { return; }
+  button.addEventListener("click", function () {
+    mode = mode === "auto" ? "light" : (mode === "light" ? "dark" : "auto");
+    localStorage.setItem("piso-theme", mode);
+    apply();
+  });
+})();
+</script>
 {{SCRIPT}}
 </body>
 </html>

@@ -73,6 +73,9 @@ fn panel_router(state: Shared) -> Router {
         .route("/", get(index))
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
+        .route("/assets/offline-sprite-1x.png", get(sprite_1x))
+        .route("/assets/offline-sprite-2x.png", get(sprite_2x))
+        .route("/assets/press-start-2p.woff2", get(font))
         .route("/api/auth", get(auth_check))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -100,6 +103,27 @@ async fn app_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css")],
         include_str!("../web/admin/app.css"),
+    )
+}
+
+async fn sprite_1x() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, crate::assets::PNG_TYPE)],
+        crate::assets::SPRITE_1X,
+    )
+}
+
+async fn sprite_2x() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, crate::assets::PNG_TYPE)],
+        crate::assets::SPRITE_2X,
+    )
+}
+
+async fn font() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, crate::assets::FONT_TYPE)],
+        crate::assets::FONT_PRESS_START_2P,
     )
 }
 

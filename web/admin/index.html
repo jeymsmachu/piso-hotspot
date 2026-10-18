@@ -2,22 +2,27 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>piso-hotspot admin</title>
-<script>
-/* Apply the saved theme before first paint to avoid a flash. */
-try {
-  var t = localStorage.getItem("piso-theme");
-  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
-} catch (_) {}
-</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f4f4f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#16171a" media="(prefers-color-scheme: dark)">
+<title>piso-hotspot · admin</title>
+<link rel="preload" href="/assets/press-start-2p.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-<div id="app">
-  <p class="boot">loading…</p>
-</div>
-<noscript><p class="boot">The admin panel needs JavaScript.</p></noscript>
+<div id="app"></div>
+<div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+<noscript>
+  <div class="card" style="margin:16px">
+    <h2>javascript required</h2>
+    <p>The panel is a small application that talks to the daemon over
+    <span class="mono">/api</span>. Every action it offers is also a CLI command:
+    <span class="mono">piso-hotspot list</span>,
+    <span class="mono">grant</span>, <span class="mono">revoke</span>,
+    <span class="mono">friend</span>, <span class="mono">status</span>.</p>
+  </div>
+</noscript>
 <script src="/app.js"></script>
 </body>
 </html>

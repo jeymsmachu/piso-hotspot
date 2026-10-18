@@ -1,5 +1,6 @@
 //! piso-hotspot: pay-per-usage wifi hotspot.
 
+mod assets;
 mod auth;
 mod config;
 mod control;
