@@ -1,12 +1,37 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="packaging/assets/logo-white.png">
+  <img src="packaging/assets/logo.png" alt="piso-hotspot logo" width="240">
+</picture>
+
 # piso-hotspot
 
 **Turn your Linux machine into a hotspot, sell time-limited internet passes, and manage access from your phone or the command line—yay!**
 
-Connect a device, collect payment, grant a pass, and let the internet party begin. Devices without an active pass see your captive portal and payment instructions instead of getting online.
+[![CI](https://github.com/jeymsmachu/piso-hotspot/actions/workflows/ci.yml/badge.svg)](https://github.com/jeymsmachu/piso-hotspot/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+[Installation](#installation) · [Usage](#usage) · [Configuration](#making-it-yours) · [Contributing](#hacking-on-it)
+
+</div>
+
+---
+
+## Why "piso"?
+
+In the Philippines, *piso* is the peso coin — and "piso wifi" is the coin-operated Wi-Fi vending machine you'll find outside sari-sari stores, in waiting sheds, and along busy streets: insert ₱1, get minutes of internet. piso-hotspot is that idea, running on a laptop you already own: share your connection, sell time-limited passes, and keep it all under your control.
 
 > **Tiny but important detail:** piso-hotspot manages access and pass sales; it doesn't collect or process the payment for you. That's still between you and your customer.
 
-You'll need a Linux machine with a Wi-Fi adapter that supports access-point mode, plus an internet connection to share. (Offline mode is available for testing.)
+## How does it work?
+
+1. A device connects to the hotspot's Wi-Fi. It can associate, get an address, and resolve names — but the kernel firewall drops its internet traffic.
+2. Any web page it tries to open lands on **your captive portal**: your message, your payment instructions, the pass menu. (DNS is never tampered with; HTTPS probes are refused immediately so browsers fall back instead of hanging.)
+3. The customer pays you — cash, GCash, however you do it — and you grant a pass from your phone or the command line.
+4. The pass lands in the firewall's allow-list, keyed by MAC address, and their traffic flows through NAT to the internet. When time is up, the same packet-level gate cuts them off.
+
+Every step above is enforced in-kernel, per device: joining the Wi-Fi is not enough to get online, and one payer can't smuggle a friend's traffic through their own connection.
 
 ## Status and caution
 
@@ -14,9 +39,11 @@ This project is still in **beta!** It contains LLM-generated and LLM-assisted co
 
 ## Installation
 
-### 1. Install the dependencies
+### Prerequisites
 
-`iw`, `hostapd`, `dnsmasq`, `nft` (nftables), and `ip` (iproute2) are required. Bluetooth tethering works through a normal network interface, so it needs no extra package.
+- A Linux machine with a Wi-Fi adapter that supports **access-point mode** (`piso-hotspot doctor` tells you)
+- An internet connection to share: a USB-tethered phone or ethernet by default; a second Wi-Fi radio (`--dual-radio`), or one special radio that can do client+AP at once (`--wifi-uplink`)
+- `iw`, `hostapd`, `dnsmasq`, `nftables`, and `iproute2` (the commands `iw`, `hostapd`, `dnsmasq`, `nft`, `ip`)
 
 | Distribution | Command |
 | --- | --- |
@@ -26,16 +53,20 @@ This project is still in **beta!** It contains LLM-generated and LLM-assisted co
 | openSUSE | `sudo zypper install iw hostapd dnsmasq nftables iproute2` |
 | Alpine | `sudo apk add iw hostapd dnsmasq nftables iproute2` |
 
-### 2. Install piso-hotspot
+### One-line install
 
-Pick the artifact for your machine and distribution:
+```bash
+curl -fsSL https://raw.githubusercontent.com/jeymsmachu/piso-hotspot/main/install.sh | bash
+```
+
+It detects your architecture, shows a progress bar, verifies the checksum, checks the dependencies, and installs to `/usr/local/bin`. Add `--nightly` for the freshest build (and potentially fresher bugs). Prefer not to pipe curl into bash? [Read the script first](install.sh) — it's short.
+
+### Packages and manual install
 
 | Architecture | Binary | Debian / Ubuntu | Fedora / RHEL | AppImage |
 | --- | --- | --- | --- | --- |
 | x86-64 (most Intel/AMD PCs) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64-unknown-linux-gnu) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64-unknown-linux-gnu) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-amd64.deb) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-amd64.deb) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.rpm) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.rpm) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.AppImage) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.AppImage) |
 | ARM64 / AArch64 | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64-unknown-linux-gnu) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64-unknown-linux-gnu) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-arm64.deb) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-arm64.deb) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.rpm) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.rpm) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.AppImage) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.AppImage) |
-
-**Stable** is the sensible pick for everyday use; **nightly** is rebuilt from `main` and is for trying the freshest changes (and potentially fresher bugs). Every release ships a `sha256sums.txt`.
 
 Debian / Ubuntu:
 
@@ -56,24 +87,9 @@ chmod +x piso-hotspot-x86_64.AppImage        # or the raw binary
 sudo install -Dm755 piso-hotspot-x86_64.AppImage /usr/local/bin/piso-hotspot
 ```
 
-Arch users should build the package from the release tag instead of using a hosted binary, so it links against the local system correctly:
+Arch users: build from the release tag so it links against your system correctly — `packaging/aur/PKGBUILD` is in the repo, `makepkg -si` from `packaging/aur/` after checking out the tag.
 
-```bash
-git clone https://github.com/jeymsmachu/piso-hotspot.git
-cd piso-hotspot/packaging/aur && makepkg -si
-```
-
-### 3. Check the machine
-
-```bash
-piso-hotspot doctor
-```
-
-`doctor` only inspects your system; it changes nothing. It reports the radios it found, whether each supports AP mode (and whether one radio can be a client and an AP at the same time), the uplinks it can share, and which modes are available. If no hotspot mode is available, it says what is missing. It exits non-zero in that case, so scripts can rely on it.
-
-### Or, build it yourself
-
-You'll need Git and the stable Rust toolchain. Get Rust from [rustup.rs](https://rustup.rs/), then:
+Build from source instead? You'll need Git and the stable Rust toolchain from [rustup.rs](https://rustup.rs/):
 
 ```bash
 git clone https://github.com/jeymsmachu/piso-hotspot.git
@@ -81,6 +97,14 @@ cd piso-hotspot
 cargo build --release --locked
 sudo install -Dm755 target/release/piso-hotspot /usr/local/bin/piso-hotspot
 ```
+
+Then check the machine:
+
+```bash
+piso-hotspot doctor
+```
+
+`doctor` only inspects your system; it changes nothing. It reports the radios it found, whether each supports AP mode (and whether one radio can do client+AP at once), the uplinks it can share, and which modes are available. If no hotspot mode is available, it says what's missing — and exits non-zero, so scripts can rely on it.
 
 ## Usage
 
@@ -93,19 +117,19 @@ sudo piso-hotspot stop     # tear everything down, hand the radio back
 
 `start` refuses before touching anything when no uplink is available, and installs the paywall *before* forwarding is enabled so no device ever sees ungated internet.
 
-There are three more ways to start it:
+Three more ways to start it:
 
 | Mode | Use when | Needs |
 | --- | --- | --- |
-| `sudo piso-hotspot start --dual-radio` | You have two radios and want the laptop to stay online over Wi-Fi while the other radio beacons | Two radios, one connected as a Wi-Fi client |
-| `sudo piso-hotspot start --wifi-uplink` | You have one radio whose driver supports client+AP at the same time | A driver advertising that combination (`doctor` says) |
-| `sudo piso-hotspot start --offline` | You want to test the paywall and panel without internet | Nothing — but see the warning below |
+| `sudo piso-hotspot start --dual-radio` | You have two radios and want the laptop to stay online over Wi-Fi while the other beacons | Two radios, one connected as a Wi-Fi client |
+| `sudo piso-hotspot start --wifi-uplink` | One radio whose driver supports client+AP at once | A driver advertising that combination (`doctor` says) |
+| `sudo piso-hotspot start --offline` | Testing the paywall and panel without internet | Nothing — but see the warning |
 
-**Wi-Fi heads-up:** in the default mode the radio used for the hotspot is busy being an access point, so the machine's own Wi-Fi connection may drop. `--dual-radio` and `--wifi-uplink` exist to avoid that.
+**Wi-Fi heads-up:** in the default mode the hotspot radio is busy being an access point, so the machine's own Wi-Fi connection may drop. `--dual-radio` and `--wifi-uplink` exist to avoid that.
 
-**Offline warning:** `--offline` still spends an AP-capable radio. On a laptop where that is the same radio carrying your internet, you will lose connectivity for the duration.
+**Offline warning:** `--offline` still spends an AP-capable radio. On a laptop where that's the same radio carrying your internet, you'll lose connectivity for the duration.
 
-If several radios or uplinks are available, pin them in the config (`ap.interface`, `ap.uplink`) instead of relying on auto-selection. With two connected Wi-Fi stations and no pinned uplink, `--dual-radio` refuses rather than guessing.
+Several radios or uplinks? Pin them in the config (`ap.interface`, `ap.uplink`) instead of relying on auto-selection — with two connected Wi-Fi stations and nothing pinned, `--dual-radio` refuses rather than guessing.
 
 ### Open the admin panel
 
@@ -113,9 +137,9 @@ If several radios or uplinks are available, pin them in the config (`ap.interfac
 sudo piso-hotspot status
 ```
 
-It prints the mode, the gateway, the panel addresses, and the admin passphrase. The panel answers on the gateway (`http://10.10.0.1:8080`), on the machine itself, and on the uplink address — so a phone on either side of the link can run it. Open one of those addresses and sign in.
+It prints the mode, the gateway, the panel addresses, and the admin passphrase. The panel answers on the gateway (`http://10.10.0.1:8080`), on the machine itself, and on the uplink address — so a phone on *either* side of the link can run it. Open one of those addresses and sign in.
 
-From the panel you can see devices and active passes, watch traffic and sales, sell passes with one tap, revoke access, rename devices, and give trusted devices free access. The panel is plain HTTP on your local network; the passphrase is a local credential, not an internet-facing one.
+From the panel you can see devices and active passes, watch traffic and sales, sell passes with one tap, revoke access, rename devices, and give trusted devices free access. The panel is plain HTTP on your local network; treat the passphrase as a local credential, not an internet-facing one.
 
 If you haven't set an admin passphrase in `/etc/piso-hotspot/config.json`, a fresh one is generated at every start and shown by `sudo piso-hotspot status`.
 
@@ -146,11 +170,11 @@ sudo piso-hotspot friends                      # list free-access devices
 piso-hotspot --help                            # every command
 ```
 
-Enforcement is per MAC address in the kernel firewall: joining the Wi-Fi is not enough to get online, and `revoke` cuts existing connections on the next packet.
+## Keeping it running
 
-### What students see
+The daemon survives a closed terminal, so the panel and paywall keep working. **A suspended machine does not:** it drops every connection and stops enforcing the paywall. Disable sleep while the hotspot runs (on AC power), or mask the sleep targets. A systemd unit and more install notes live in [docs/INSTALL.md](docs/INSTALL.md).
 
-Unpaid devices get any HTTP address redirected to the portal, which shows your message, payment instructions, and the pass list. DNS is not tampered with, and HTTPS is refused immediately rather than dropped, so browsers fall back to the portal instead of hanging.
+If UFW is active, piso-hotspot opens exactly the ports the hotspot needs — DHCP, DNS, portal, and panel — scoped to the AP interface, and removes them at stop. Without that, UFW's INPUT chain silently eats those packets before the paywall rules ever see them.
 
 ## Making it yours
 
@@ -175,12 +199,6 @@ Change both example passwords before using it. The Wi-Fi password must be 8–63
 
 Every field is documented in [docs/CONFIG.md](docs/CONFIG.md), with a complete starting point in [docs/config.example.json](docs/config.example.json). Apply changes by restarting the hotspot; passes already sold keep their stored price and expiry.
 
-## Keeping it running
-
-The daemon survives a closed terminal, so the panel and paywall keep working. **A suspended machine does not:** it drops every connection and stops enforcing the paywall. Disable sleep while the hotspot runs (on AC power), or mask the sleep targets. A systemd unit and install notes are in [docs/INSTALL.md](docs/INSTALL.md).
-
-If UFW is active, piso-hotspot opens exactly the ports the hotspot needs — DHCP, DNS, portal, and panel — scoped to the AP interface, and removes them at stop. Without that, UFW's INPUT chain silently eats those packets before the paywall rules ever see them.
-
 ## Hacking on it
 
 ```bash
@@ -197,6 +215,10 @@ sudo scripts/hwsim-dual-radio.sh    # dual-radio mode, four radios
 ```
 
 `piso-smoke.sh` is the interactive hardware counterpart; it refuses to run when the chosen AP interface carries the default route, because that would disconnect the machine mid-test.
+
+## Credits
+
+Logo built with icons from [Icons8](https://icons8.com): [Hotspot](https://icons8.com/icon/OnFteDC8fjB4/hotspot) and [Peso symbol](https://icons8.com/icon/119775/peso-symbol).
 
 ## License
 
