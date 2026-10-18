@@ -26,7 +26,7 @@ echo
 
 # Identity and discovery.
 run "repos/$REPO" \
-    -f description="Pay-per-usage wifi hotspot: sell timed internet passes, enforced per MAC" \
+    -f description="pay-per-usage hotspot, yay!" \
     -f homepage="https://github.com/$REPO#readme" \
     -F has_wiki=false \
     -F has_projects=false \
