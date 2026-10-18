@@ -67,13 +67,19 @@ jobs:
             build-essential curl ca-certificates git file xz-utils \
             squashfs-tools zstd cpio
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([0-9][^"]*)".*/\1/')"
+          [ "v$VER" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml v$VER"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: release-${{ matrix.target }}
 
@@ -92,7 +98,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/piso-hotspot" target/release/piso-hotspot
 
       - name: Install packaging tools
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-deb,cargo-generate-rpm
 
@@ -139,7 +145,7 @@ jobs:
           cd dist
           sha256sum * > "sha256sums-${{ matrix.suffix }}.txt"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-${{ matrix.suffix }}
           path: dist/*
@@ -150,7 +156,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dist-*
           merge-multiple: true
