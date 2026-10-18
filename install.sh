@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/jeymsmachu/piso-hotspot/main/install.sh | bash
 #
 # Options (pass after `bash install.sh`, or as env vars when piping):
-#   --nightly      install the nightly build instead of the latest stable
+#   --nightly      install the nightly build instead of the latest release
 #   --prefix DIR   install location (default: /usr/local/bin)
 #   PISO_CHANNEL / PISO_PREFIX env equivalents for the curl | bash case.
 #
@@ -12,7 +12,7 @@
 # the single install step only.
 set -euo pipefail
 
-CHANNEL="${PISO_CHANNEL:-stable}"
+CHANNEL="${PISO_CHANNEL:-release}"
 PREFIX="${PISO_PREFIX:-/usr/local/bin}"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -26,7 +26,7 @@ done
 
 REPO="jeymsmachu/piso-hotspot"
 case "$CHANNEL" in
-    stable)  BASE="https://github.com/$REPO/releases/latest/download" ;;
+    release) BASE="https://github.com/$REPO/releases/latest/download" ;;
     nightly) BASE="https://github.com/$REPO/releases/download/nightly" ;;
     *) echo "unknown channel: $CHANNEL" >&2; exit 2 ;;
 esac

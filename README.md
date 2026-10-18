@@ -10,9 +10,10 @@
 **Turn your Linux machine into a hotspot, sell time-limited internet passes, and manage access from your phone or the command line—yay!**
 
 [![CI](https://github.com/jeymsmachu/piso-hotspot/actions/workflows/ci.yml/badge.svg)](https://github.com/jeymsmachu/piso-hotspot/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jeymsmachu/piso-hotspot)](https://github.com/jeymsmachu/piso-hotspot/releases)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-[Installation](#installation) · [Usage](#usage) · [Configuration](#making-it-yours) · [Contributing](#hacking-on-it)
+[Installation](#installation) · [Usage](#usage) · [Configuration](#making-it-yours) · [Contributing](CONTRIBUTING.md) · [FAQ](#faq)
 
 </div>
 
@@ -63,10 +64,15 @@ It detects your architecture, shows a progress bar, verifies the checksum, check
 
 ### Packages and manual install
 
-| Architecture | Binary | Debian / Ubuntu | Fedora / RHEL | AppImage |
-| --- | --- | --- | --- | --- |
-| x86-64 (most Intel/AMD PCs) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64-unknown-linux-gnu) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64-unknown-linux-gnu) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-amd64.deb) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-amd64.deb) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.rpm) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.rpm) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.AppImage) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.AppImage) |
-| ARM64 / AArch64 | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64-unknown-linux-gnu) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64-unknown-linux-gnu) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-arm64.deb) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-arm64.deb) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.rpm) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.rpm) | [stable](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.AppImage) · [nightly](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.AppImage) |
+**x86-64 (most Intel/AMD PCs)**
+
+- **Release** — [binary](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64-unknown-linux-gnu) · [.deb](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-amd64.deb) · [.rpm](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.rpm) · [AppImage](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-x86_64.AppImage)
+- **Nightly** — [binary](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64-unknown-linux-gnu) · [.deb](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-amd64.deb) · [.rpm](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.rpm) · [AppImage](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-x86_64.AppImage)
+
+**ARM64 / AArch64**
+
+- **Release** — [binary](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64-unknown-linux-gnu) · [.deb](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-arm64.deb) · [.rpm](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.rpm) · [AppImage](https://github.com/jeymsmachu/piso-hotspot/releases/latest/download/piso-hotspot-aarch64.AppImage)
+- **Nightly** — [binary](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64-unknown-linux-gnu) · [.deb](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-arm64.deb) · [.rpm](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.rpm) · [AppImage](https://github.com/jeymsmachu/piso-hotspot/releases/download/nightly/piso-hotspot-aarch64.AppImage)
 
 Debian / Ubuntu:
 
@@ -201,10 +207,35 @@ Every field is documented in [docs/CONFIG.md](docs/CONFIG.md), with a complete s
 
 ## Hacking on it
 
+The full workflow lives in [CONTRIBUTING.md](CONTRIBUTING.md); the short version:
+
 ```bash
 cargo test                          # unit tests, no root or hardware needed
 cargo run -- doctor                 # inspect this machine
 ```
+
+## FAQ
+
+**Will it work with my Wi-Fi adapter?**
+
+Run `piso-hotspot doctor`. It only inspects; it tells you which radios
+can beacon, whether one can do client+AP at once, and which start modes
+your machine supports.
+
+**Can it run on a Raspberry Pi?**
+
+Yes — ARM64/AArch64 builds ship with every release and nightly, and the
+daemon manages the radio and firewall exactly as on x86.
+
+**Does it need an internet connection?**
+
+Only to be useful. `start --offline` brings up the AP, paywall, and
+panel without any uplink.
+
+**Does it take payments?**
+
+No. piso-hotspot manages access and pass sales; the money part stays
+between you and your customer.
 
 ## Credits
 
