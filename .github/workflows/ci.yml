@@ -68,4 +68,26 @@ jobs:
           dpkg-deb -I /tmp/piso-hotspot.deb | grep -qE '^ Depends: .*hostapd'
       - name: Inspect .rpm payload
         run: |
-          zstd -dc /tmp/piso-hotspot.rpm | cpio -t 2>/dev/null | grep -q 'usr/bin/piso-hotspot'
+          # Slice at the payload's compression magic (rpm lead+headers
+          # precede it; exact header arithmetic is format-version
+          # dependent) and check the binary is inside.
+          python3 - <<'PY'
+          import sys, lzma
+          data = open("/tmp/piso-hotspot.rpm", "rb").read()
+          assert data[:4] == b"\xed\xab\xee\xdb", "not an rpm"
+          i = data.find(b"\x28\xb5\x2f\xfd")  # zstd (generate-rpm default)
+          if i >= 0:
+              import io, subprocess
+              p = subprocess.run(["zstd", "-dc"], input=data[i:],
+                                 capture_output=True)
+              if p.returncode != 0:
+                  sys.exit(f"zstd decode failed: {p.stderr.decode()[:200]}")
+              cpio = p.stdout
+          else:
+              j = data.find(b"\xfd7zXZ\x00")  # xz fallback
+              if j < 0:
+                  sys.exit("no zstd or xz payload stream found")
+              cpio = lzma.decompress(data[j:])
+          assert b"usr/bin/piso-hotspot" in cpio, "binary missing from payload"
+          print(f".rpm payload ok ({len(cpio)} bytes)")
+          PY
