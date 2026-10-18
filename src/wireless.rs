@@ -74,22 +74,41 @@ pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> Stri
 /// dnsmasq configuration: DHCP + DNS for the client subnet only.
 pub fn dnsmasq_config(cfg: &Config, iface: &str) -> String {
     let octets = cfg.gateway.octets();
-    format!(
+    let mut out = format!(
         "conf-file=/dev/null\n\
          interface={iface}\n\
          bind-interfaces\n\
          dhcp-range={first},{last},255.255.255.0,1h\n\
          dhcp-broadcast\n\
          dhcp-leasefile={leases}\n\
-         server=1.1.1.1\n\
-         server=8.8.8.8\n\
+         # Never serve the host's /etc/hosts to clients: the operator's\n\
+         # machine names are not part of what they are selling.\n\
+         no-hosts\n\
+         # Single-label names and private-range reverse lookups stay local\n\
+         # instead of being forwarded upstream.\n\
          domain-needed\n\
          bogus-priv\n\
-         log-dhcp\n",
+         log-dhcp\n\
+         # `-` means stderr, which the daemon points at its log file: this\n\
+         # is the log the troubleshooting docs tell people to read.\n\
+         log-facility=-\n",
         first = Ipv4Addr::new(octets[0], octets[1], octets[2], 10),
         last = Ipv4Addr::new(octets[0], octets[1], octets[2], 254),
         leases = LEASE_FILE,
-    )
+    );
+    // Upstream resolvers. Explicit ones are the whole story (`no-resolv`),
+    // because that is what "set your DNS servers" means. Without them the
+    // system's own resolvers are used, which is what a `--wifi-uplink`
+    // hotspot needs: the network it is attached to provides them.
+    if cfg.upstream_dns.is_empty() {
+        out.push_str("# upstream: the system's own resolvers\n");
+    } else {
+        out.push_str("no-resolv\n");
+        for server in &cfg.upstream_dns {
+            out.push_str(&format!("server={server}\n"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -185,7 +204,40 @@ mod tests {
     fn dnsmasq_ignores_system_config() {
         let out = dnsmasq_config(&cfg(), "wlan0");
         assert!(out.starts_with("conf-file=/dev/null"));
+        // The host's /etc/hosts and single-label lookups stay out of what
+        // clients get, and DHCP/DNS lines land in the daemon log (#11).
+        assert!(out.contains("no-hosts"));
+        assert!(out.contains("domain-needed"));
+        assert!(out.contains("bogus-priv"));
+        assert!(out.contains("log-facility=-"));
+        assert!(out.contains("log-dhcp"));
+    }
+
+    #[test]
+    fn dnsmasq_uses_the_configured_upstreams_exclusively() {
+        let mut c = cfg();
+        assert!(
+            !dnsmasq_config(&c, "wlan0").contains("no-resolv"),
+            "without explicit servers the host's resolvers are used"
+        );
+
+        c.upstream_dns = vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)];
+        let out = dnsmasq_config(&c, "wlan0");
+        assert!(out.contains("no-resolv"));
         assert!(out.contains("server=1.1.1.1"));
+        assert!(out.contains("server=9.9.9.9"));
+    }
+
+    #[test]
+    fn upstream_dns_is_validated() {
+        let mut c = cfg();
+        c.upstream_dns = vec![Ipv4Addr::UNSPECIFIED];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("upstream_dns"), "{err}");
+        c.upstream_dns = (0..5)
+            .map(|i| Ipv4Addr::new(1, 1, 1, 1 + i))
+            .collect::<Vec<_>>();
+        assert!(c.validate().unwrap_err().to_string().contains("at most 4"));
     }
 
     #[test]

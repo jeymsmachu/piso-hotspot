@@ -42,10 +42,27 @@ pub(crate) const RUN_DIR: &str = "/run/piso-hotspot";
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Set by signals and by "a child died"; the main loop watches it.
+/// Set by signals and by "something is wrong"; the main loop watches it.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// Which supervised process died first, if that is why we are shutting down.
-static CHILD_DEATH: Mutex<Option<String>> = Mutex::new(None);
+/// Why the daemon is shutting down, when it is not an operator's stop.
+static SHUTDOWN_REASON: Mutex<Option<String>> = Mutex::new(None);
+
+/// Is the daemon on its way out?
+pub(crate) fn shutting_down() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// Shut the hotspot down and say why: a helper in a crash loop, or an
+/// access point that cannot be re-asserted. systemd restarts the unit on
+/// failure, so this is a recovery path, not a surrender.
+pub(crate) fn shutdown_with(reason: impl Into<String>) {
+    if let Ok(mut slot) = SHUTDOWN_REASON.lock()
+        && slot.is_none()
+    {
+        *slot = Some(reason.into());
+    }
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 extern "C" fn on_signal(_sig: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -85,6 +102,12 @@ pub struct RunningRecord {
     pub portal_enabled: bool,
     #[serde(default = "default_panel_port")]
     pub panel_port: u16,
+    /// PIDs of the supervised helpers, so `stop` can clean up after a
+    /// daemon that was killed instead of asked (#10).
+    #[serde(default)]
+    pub hostapd_pid: Option<u32>,
+    #[serde(default)]
+    pub dnsmasq_pid: Option<u32>,
 }
 
 fn default_panel_port() -> u16 {
@@ -174,7 +197,7 @@ fn lease_addresses() -> Vec<paywall::LeaseAddress> {
         .collect()
 }
 
-fn cmd_out(program: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn cmd_out(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
     out.status
         .success()
@@ -271,6 +294,13 @@ pub(crate) fn health(d: &mut Daemon, live: bool) -> Vec<String> {
         None => warnings.push("the firewall reconciler has not run yet".into()),
     }
 
+    // Recent helper restarts are not failures, but an operator needs to
+    // see them: they are the difference between "quiet" and "quietly
+    // flapping".
+    for note in &d.restart_notes {
+        warnings.push(note.clone());
+    }
+
     if let Some(e) = &d.panel_error {
         warnings.push(format!("the admin panel is not serving: {e}"));
     }
@@ -315,12 +345,20 @@ pub fn stop() -> Result<(), String> {
         return Ok(());
     }
 
-    // Nothing recorded: at most a stale paywall table (ours by name).
+    // Nothing recorded: at most a stale paywall table (ours by name) and
+    // maybe a forwarding value we changed without a record (#10).
     let stale_fw = Firewall::system("", None, Ipv4Addr::UNSPECIFIED, 0, false);
+    let mut said_something = false;
     if stale_fw.table_exists() {
         let _ = stale_fw.uninstall();
         println!("piso-hotspot: removed a stale paywall table; interfaces untouched");
-    } else {
+        said_something = true;
+    }
+    if let Some(previous) = restore_forwarding_from_marker() {
+        println!("piso-hotspot: restored ip_forward={previous}");
+        said_something = true;
+    }
+    if !said_something {
         println!("piso-hotspot: not running");
     }
     Ok(())
@@ -332,6 +370,87 @@ fn read_pid() -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Where the pre-hotspot value of `net.ipv4.ip_forward` is kept.
+///
+/// The running record is the first place; this is the fallback for when
+/// the record itself is lost, and it is written *before* the value is
+/// changed, so a crash in between still leaves enough to undo it (#10).
+const FORWARDING_MARKER: &str = "/run/piso-hotspot/ip_forward.prev";
+
+fn write_forwarding_marker(previous: &str) {
+    if let Err(e) = fs::write(FORWARDING_MARKER, previous) {
+        log_warn!("cannot write {FORWARDING_MARKER}: {e}");
+    }
+}
+
+/// Put `net.ipv4.ip_forward` back the way we found it and forget the
+/// marker. Returns the value that was restored.
+fn restore_forwarding_from_marker() -> Option<String> {
+    let previous = fs::read_to_string(FORWARDING_MARKER).ok()?;
+    let previous = previous.trim().to_string();
+    if previous.is_empty() {
+        return None;
+    }
+    let _ = radio::set_ip_forward(previous == "1");
+    let _ = fs::remove_file(FORWARDING_MARKER);
+    Some(previous)
+}
+
+/// Rewrite the running record in place, keeping it in sync with what the
+/// daemon is actually running.
+fn update_record(edit: impl FnOnce(&mut RunningRecord)) {
+    let Ok(text) = fs::read_to_string(RUNNING_FILE) else {
+        return;
+    };
+    let Ok(mut record) = serde_json::from_str::<RunningRecord>(&text) else {
+        return;
+    };
+    edit(&mut record);
+    if let Ok(text) = serde_json::to_string_pretty(&record) {
+        let _ = fs::write(RUNNING_FILE, text);
+    }
+}
+
+/// Record the helpers' PIDs: it is what lets `stop` clean up after a
+/// daemon that was killed rather than asked (#10).
+fn record_helper_pids(d: &Daemon) {
+    let hostapd = d.hostapd.as_ref().map(std::process::Child::id);
+    let dnsmasq = d.dnsmasq.as_ref().map(std::process::Child::id);
+    update_record(|rec| {
+        rec.hostapd_pid = hostapd;
+        rec.dnsmasq_pid = dnsmasq;
+    });
+}
+
+/// Kill a helper we started, after checking the pid is still that helper:
+/// a recycled pid must never be a reason to kill a stranger.
+fn kill_recorded_helper(pid: u32, program: &str) {
+    let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    if !cmdline.contains(program) {
+        log_warn!("not killing pid {pid}: it is not {program} any more");
+        return;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    for _ in 0..10 {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+/// Kill the helpers a worker record points at, so a crashed run does not
+/// leave DHCP and DNS serving stale answers (and the port occupied).
+fn kill_recorded_helpers(record: &RunningRecord) {
+    if let Some(pid) = record.dnsmasq_pid {
+        kill_recorded_helper(pid, "dnsmasq");
+    }
+    if let Some(pid) = record.hostapd_pid {
+        kill_recorded_helper(pid, "hostapd");
+    }
+}
+
 fn cleanup_from_record() {
     let Ok(text) = fs::read_to_string(RUNNING_FILE) else {
         return;
@@ -339,6 +458,10 @@ fn cleanup_from_record() {
     let Ok(record) = serde_json::from_str::<RunningRecord>(&text) else {
         return;
     };
+    // Orphan helpers first: a crashed daemon leaves hostapd and dnsmasq
+    // running, holding the DHCP and DNS ports, and the next start fails
+    // with "Address already in use" (#10).
+    kill_recorded_helpers(&record);
     let fw = Firewall::system(
         record.ap_iface.clone(),
         record.uplink.clone(),
@@ -351,11 +474,22 @@ fn cleanup_from_record() {
     ufw::close(&record.ap_iface, record.portal_enabled, record.panel_port);
     let _ = shaper::clear(&record.ap_iface);
     let _ = radio::set_gateway(&record.ap_iface, &record.gateway, false);
-    if let Some(prev) = &record.ip_forward_prev
-        && let Ok(current) = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-        && current.trim() != prev
-    {
-        let _ = radio::set_ip_forward(prev == "1");
+    // Forwarding: the record knows the old value; the marker knows it
+    // even when the record was lost.
+    let restored = record
+        .ip_forward_prev
+        .clone()
+        .map(|prev| {
+            if let Ok(current) = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+                && current.trim() != prev
+            {
+                let _ = radio::set_ip_forward(prev == "1");
+            }
+            prev
+        })
+        .or_else(restore_forwarding_from_marker);
+    if let Some(prev) = restored {
+        log_info!("restored ip_forward={prev}");
     }
     if record.mode == "wifi-uplink" {
         // The station was never ours to touch; only remove the virtual AP.
@@ -365,6 +499,7 @@ fn cleanup_from_record() {
     }
     let _ = fs::remove_file(RUNNING_FILE);
     let _ = fs::remove_file(PID_FILE);
+    let _ = fs::remove_file(FORWARDING_MARKER);
 }
 
 // -------------------------------------------------------------- daemon side
@@ -396,14 +531,26 @@ pub(crate) struct Daemon {
     /// live), so the panel can show them without spawning processes.
     pub(crate) health: Vec<String>,
     pub(crate) health_at: i64,
+    /// Helper restarts, newest last: "dnsmasq restarted (attempt 1) after
+    /// exit status: 1".
+    pub(crate) restart_notes: Vec<String>,
+    /// Channel hostapd is beaconing on (follows the station in
+    /// `--wifi-uplink`).
+    pub(crate) ap_channel: u8,
+    /// Set by a restarted helper or a revoked rule: the next tick must
+    /// bring the kernel back in step immediately.
+    pub(crate) needs_reconcile: bool,
     /// Why the panel or the portal is not serving, when that happened:
     /// both are optional services, and a silent failure reads as "the
     /// panel is down and nothing says why".
     pub(crate) panel_error: Option<String>,
     pub(crate) portal_error: Option<String>,
     ip_forward_prev: Option<String>,
-    hostapd: Option<Child>,
-    dnsmasq: Option<Child>,
+    /// Supervised helpers. Visible to the supervisor in
+    /// [`crate::keepalive`], which is the only thing besides teardown
+    /// that touches them.
+    pub(crate) hostapd: Option<Child>,
+    pub(crate) dnsmasq: Option<Child>,
 }
 
 /// The outcome of the most recent reconcile tick.
@@ -412,6 +559,16 @@ pub(crate) struct ReconcileNote {
     pub at: i64,
     pub summary: String,
     pub error: Option<String>,
+}
+
+impl Daemon {
+    /// The addresses the panel answers on right now: localhost, the
+    /// gateway, and the uplink side. Recomputed when the uplink's address
+    /// may have changed (a roam, a resume, a DHCP renewal) so `status`
+    /// never advertises a dead URL.
+    pub(crate) fn compute_panel_urls(&self) -> Vec<String> {
+        panel_urls(self.fw.gateway, self.cfg.ap.port, self.fw.uplink.as_deref())
+    }
 }
 
 /// Entry point for the hidden `daemon` subcommand.
@@ -443,12 +600,14 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGHUP, handler);
     }
-    fs::write(PID_FILE, format!("{}\n", std::process::id())).map_err(|e| e.to_string())?;
-
-    // Leftovers from a crashed previous run: finish their teardown first.
+    // Leftovers from a crashed previous run: finish their teardown
+    // *before* we write our own pid file — that file is how systemd
+    // (Type=forking) learns the daemon started, and the recovery path
+    // used to delete it out from under us (#7).
     if !control::alive() && Path::new(RUNNING_FILE).exists() {
         cleanup_from_record();
     }
+    fs::write(PID_FILE, format!("{}\n", std::process::id())).map_err(|e| e.to_string())?;
 
     let cfg = Config::load(&config::config_path()).map_err(|e| e.to_string())?;
     let conn = store::open(&config::state_path()).map_err(|e| e.to_string())?;
@@ -471,6 +630,8 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         started_at: now(),
         portal_enabled: cfg.portal.enabled,
         panel_port: cfg.ap.port,
+        hostapd_pid: None,
+        dnsmasq_pid: None,
     };
     fs::write(
         RUNNING_FILE,
@@ -492,6 +653,9 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         (cfg.admin.passphrase.clone(), false)
     };
 
+    // What channel the AP beacons on: the operator's, or — in
+    // `--wifi-uplink` — the station's, which the single radio forces.
+    let ap_channel = plan.station_channel.unwrap_or(cfg.ap.channel);
     let mut daemon = Daemon {
         cfg,
         conn,
@@ -506,6 +670,9 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         last_reconcile: None,
         health: Vec::new(),
         health_at: 0,
+        restart_notes: Vec::new(),
+        ap_channel,
+        needs_reconcile: false,
         panel_error: None,
         portal_error: None,
         ip_forward_prev: None,
@@ -518,11 +685,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         teardown(&mut daemon);
         return Err(e);
     }
-    daemon.panel_urls = panel_urls(
-        daemon.fw.gateway,
-        daemon.cfg.ap.port,
-        daemon.fw.uplink.as_deref(),
-    );
+    daemon.panel_urls = daemon.compute_panel_urls();
     log_info!("hotspot up; panel: {:?}", daemon.panel_urls);
 
     let port = daemon.cfg.ap.port;
@@ -530,7 +693,12 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     let daemon = Arc::new(Mutex::new(daemon));
     serve(Arc::clone(&daemon));
     spawn_reconciler(Arc::clone(&daemon));
-    spawn_child_watch(Arc::clone(&daemon));
+    {
+        // Helper supervision runs on its own thread: it sleeps between
+        // restart attempts and must never hold the daemon's lock (#6).
+        let watched = Arc::clone(&daemon);
+        std::thread::spawn(move || crate::keepalive::watch_children(watched));
+    }
     {
         let panel_state = Arc::clone(&daemon);
         std::thread::spawn(move || {
@@ -561,11 +729,11 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let death = CHILD_DEATH.lock().ok().and_then(|d| d.clone());
+    let reason = SHUTDOWN_REASON.lock().ok().and_then(|r| r.clone());
     let mut d = daemon.lock().map_err(|_| "state poisoned".to_string())?;
     teardown(&mut d);
-    match death {
-        Some(what) => Err(format!("{what} died; hotspot shut down")),
+    match reason {
+        Some(reason) => Err(reason),
         None => Ok(()),
     }
 }
@@ -901,17 +1069,15 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
         shaper::apply(&plan.ap_iface, caps).map_err(|e| format!("applying bandwidth caps: {e}"))?;
     }
 
-    d.ip_forward_prev =
-        Some(radio::set_ip_forward(true).map_err(|e| format!("enabling ip_forward: {e}"))?);
-    // Record the previous value for `stop` recovery.
-    if let Ok(text) = fs::read_to_string(RUNNING_FILE)
-        && let Ok(mut rec) = serde_json::from_str::<RunningRecord>(&text)
-    {
-        rec.ip_forward_prev = d.ip_forward_prev.clone();
-        if let Ok(text) = serde_json::to_string_pretty(&rec) {
-            let _ = fs::write(RUNNING_FILE, text);
-        }
-    }
+    // Forwarding comes last, and what we are about to change is written
+    // down *first*: a crash between the two must still leave a `stop`
+    // (or the next start) able to put the machine back (#10). The marker
+    // file is the fallback for when the record itself is lost.
+    let previous = radio::read_ip_forward().map_err(|e| format!("reading ip_forward: {e}"))?;
+    d.ip_forward_prev = Some(previous.clone());
+    write_forwarding_marker(&previous);
+    update_record(|rec| rec.ip_forward_prev = Some(previous.clone()));
+    radio::set_ip_forward(true).map_err(|e| format!("enabling ip_forward: {e}"))?;
 
     fs::write(
         wireless::DNSMASQ_CONF,
@@ -939,12 +1105,15 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
         .map_err(|e| format!("starting dnsmasq: {e}"))?,
     );
     expect_alive(&mut d.dnsmasq, "dnsmasq")?;
+    d.ap_channel = plan.station_channel.unwrap_or(d.cfg.ap.channel);
+    record_helper_pids(d);
 
     d.hostapd = Some(
         supervise("hostapd", &[wireless::HOSTAPD_CONF])
             .map_err(|e| format!("starting hostapd: {e}"))?,
     );
     expect_alive(&mut d.hostapd, "hostapd")?;
+    record_helper_pids(d);
 
     // Everything is in place: bring the firewall in step with the store.
     let leases = lease_addresses();
@@ -974,11 +1143,23 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-fn supervise(program: &str, args: &[&str]) -> std::io::Result<Child> {
-    Command::new(program).args(args).spawn()
+pub(crate) fn supervise(program: &str, args: &[&str]) -> std::io::Result<Child> {
+    let mut command = Command::new(program);
+    command.args(args);
+    // If this daemon dies without cleaning up (SIGKILL, a panic), the
+    // kernel takes the helper with it: an orphaned dnsmasq keeps the DHCP
+    // and DNS ports and makes the next start fail with "Address already
+    // in use" (#10).
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    command.spawn()
 }
 
-fn expect_alive(child: &mut Option<Child>, name: &str) -> Result<(), String> {
+pub(crate) fn expect_alive(child: &mut Option<Child>, name: &str) -> Result<(), String> {
     std::thread::sleep(Duration::from_millis(400));
     match child {
         Some(c) => match c.try_wait() {
@@ -1009,6 +1190,10 @@ fn teardown(d: &mut Daemon) {
     let _ = radio::set_gateway(&d.fw.ap_iface, &gateway, false);
     if let Some(prev) = d.ip_forward_prev.take() {
         let _ = radio::set_ip_forward(prev == "1");
+    } else {
+        // No value in memory (a path we do not control): the marker still
+        // knows what the machine looked like before we started.
+        let _ = restore_forwarding_from_marker();
     }
     if d.mode == "wifi-uplink" {
         // The station and NetworkManager were never touched; only the
@@ -1020,6 +1205,7 @@ fn teardown(d: &mut Daemon) {
     for file in [
         PID_FILE,
         RUNNING_FILE,
+        FORWARDING_MARKER,
         control::SOCKET_PATH,
         wireless::HOSTAPD_CONF,
         wireless::DNSMASQ_CONF,
@@ -1238,17 +1424,79 @@ fn err_str(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// The loop that keeps the kernel honest: expire passes, sync sets,
-/// notice new devices via our own DHCP leases.
+/// The loop that keeps the hotspot alive: expire passes, sync sets,
+/// notice new devices via our own DHCP leases, and check that the things
+/// the hotspot depends on are still there (#4, #8, #9).
 fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
     std::thread::spawn(move || {
+        let mut last_tick = now();
+        let mut wait = RECONCILE_INTERVAL;
         while !SHUTDOWN.load(Ordering::SeqCst) {
-            std::thread::sleep(RECONCILE_INTERVAL);
+            std::thread::sleep(wait);
             if SHUTDOWN.load(Ordering::SeqCst) {
                 return;
             }
             let Ok(mut d) = d.lock() else { return };
             let now_ts = now();
+
+            // A wall-clock jump is the machine having slept: monotonic
+            // time stops while suspended, wall time does not (#4).
+            if crate::keepalive::slept_through(now_ts - last_tick, RECONCILE_INTERVAL) {
+                crate::keepalive::resume_recovery(&mut d);
+            }
+            last_tick = now_ts;
+
+            // An interface can be taken away without anyone telling us:
+            // NetworkManager reclaiming it, a driver reset, a `iw` by
+            // hand (#8).
+            match crate::keepalive::ap_state(&d.fw.ap_iface) {
+                crate::keepalive::ApState::Fine => {}
+                crate::keepalive::ApState::ModeLost { iface, detail } => {
+                    let problem = format!("{iface} is not an access point any more ({detail})");
+                    log_error!("{problem}; taking the interface back");
+                    if let Err(e) = crate::keepalive::reassert_ap(&mut d) {
+                        let reason = format!("{problem}, and re-asserting it failed: {e}");
+                        log_error!("{reason}; shutting down so the service restarts cleanly");
+                        shutdown_with(reason);
+                        return;
+                    }
+                }
+                crate::keepalive::ApState::Missing { iface } => {
+                    let reason = format!("the access point interface {iface} no longer exists");
+                    log_error!("{reason}; shutting down");
+                    shutdown_with(reason);
+                    return;
+                }
+            }
+
+            // The station side of `--wifi-uplink`: a roam moves the
+            // channel the AP must be on, and a disconnect means there is
+            // nothing left to sell (#9).
+            if d.mode == "wifi-uplink"
+                && let Some(uplink) = d.fw.uplink.clone()
+            {
+                let link = crate::keepalive::station_link(&uplink).unwrap_or_default();
+                match crate::keepalive::uplink_change(&uplink, d.ap_channel, &link) {
+                    crate::keepalive::UplinkChange::Fine => {}
+                    crate::keepalive::UplinkChange::Disconnected { iface } => log_error!(
+                        "the uplink station {iface} is not associated; clients have no internet"
+                    ),
+                    crate::keepalive::UplinkChange::ChannelChanged { to, .. } => {
+                        if let Err(e) = crate::keepalive::follow_channel(&mut d, to) {
+                            log_error!("cannot follow the station to channel {to}: {e}");
+                        }
+                    }
+                }
+            }
+
+            // The uplink address changes under us (DHCP renewal, roam);
+            // the advertised panel URLs have to follow (#9).
+            let urls = d.compute_panel_urls();
+            if urls != d.panel_urls {
+                log_info!("panel addresses changed: {urls:?}");
+                d.panel_urls = urls;
+            }
+
             let leases = lease_addresses();
             match paywall::reconcile(&d.conn, &d.fw, now_ts, &leases) {
                 Ok(outcome) => {
@@ -1300,42 +1548,14 @@ fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
                 ),
                 Err(e) => log_warn!("prune failed: {e}"),
             }
-        }
-    });
-}
-
-/// If hostapd or dnsmasq dies, the hotspot is a lie — shut down.
-fn spawn_child_watch(d: Arc<Mutex<Daemon>>) {
-    std::thread::spawn(move || {
-        while !SHUTDOWN.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(500));
-            let mut death: Option<String> = None;
-            {
-                let Ok(mut guard) = d.lock() else { return };
-                if let Some(status) = guard
-                    .hostapd
-                    .as_mut()
-                    .and_then(|c| c.try_wait().ok().flatten())
-                {
-                    death = Some(format!("hostapd ({status})"));
-                } else if let Some(status) = guard
-                    .dnsmasq
-                    .as_mut()
-                    .and_then(|c| c.try_wait().ok().flatten())
-                {
-                    death = Some(format!("dnsmasq ({status})"));
-                }
-            }
-            if let Some(what) = death {
-                if SHUTDOWN.load(Ordering::SeqCst) {
-                    return;
-                }
-                if let Ok(mut slot) = CHILD_DEATH.lock() {
-                    *slot = Some(what);
-                }
-                SHUTDOWN.store(true, Ordering::SeqCst);
-                return;
-            }
+            // A restarted helper or a lost interface deserves a prompt
+            // second look rather than the next regular tick.
+            wait = if d.needs_reconcile {
+                d.needs_reconcile = false;
+                Duration::from_secs(2)
+            } else {
+                RECONCILE_INTERVAL
+            };
         }
     });
 }
@@ -1508,6 +1728,9 @@ mod tests {
             last_reconcile: None,
             health: Vec::new(),
             health_at: 0,
+            restart_notes: Vec::new(),
+            ap_channel: 6,
+            needs_reconcile: false,
             panel_error: None,
             portal_error: None,
             ip_forward_prev: None,

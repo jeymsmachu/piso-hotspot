@@ -67,6 +67,11 @@ pub struct Config {
     /// Sales and audit rows are kept forever.
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+    /// DNS servers handed to clients, e.g. `["1.1.1.1", "9.9.9.9"]`.
+    /// Empty (the default) uses the host's own resolvers, which is what a
+    /// `--wifi-uplink` hotspot needs.
+    #[serde(default)]
+    pub upstream_dns: Vec<Ipv4Addr>,
 }
 
 fn default_retention_days() -> u32 {
@@ -173,6 +178,7 @@ impl Default for Config {
             ui: UiSettings::default(),
             bandwidth: BandwidthSettings::default(),
             retention_days: default_retention_days(),
+            upstream_dns: Vec::new(),
         }
     }
 }
@@ -367,6 +373,16 @@ impl Config {
         }
         if self.retention_days == 0 {
             problems.push("retention_days must be at least 1".to_string());
+        }
+        if self.upstream_dns.len() > 4 {
+            problems.push("upstream_dns: at most 4 servers".to_string());
+        }
+        for server in &self.upstream_dns {
+            if server.is_unspecified() || server.is_loopback() || server.is_broadcast() {
+                problems.push(format!(
+                    "upstream_dns {server} is not a usable DNS server address"
+                ));
+            }
         }
         if self.passes.is_empty() {
             problems.push("at least one pass must be configured".to_string());

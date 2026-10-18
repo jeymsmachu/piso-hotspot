@@ -111,11 +111,17 @@ pub fn set_gateway(iface: &str, gateway: &str, up: bool) -> Result<(), RadioErro
 
 pub fn set_ip_forward(enabled: bool) -> Result<String, RadioError> {
     let path = "/proc/sys/net/ipv4/ip_forward";
-    let previous = std::fs::read_to_string(path)
-        .map_err(|e| RadioError::Command("ip_forward", e.to_string()))?;
+    let previous = read_ip_forward()?;
     std::fs::write(path, if enabled { "1\n" } else { "0\n" })
         .map_err(|e| RadioError::Command("ip_forward", e.to_string()))?;
-    Ok(previous.trim().to_string())
+    Ok(previous)
+}
+
+/// What `/proc/sys/net/ipv4/ip_forward` says right now.
+pub fn read_ip_forward() -> Result<String, RadioError> {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|value| value.trim().to_string())
+        .map_err(|e| RadioError::Command("ip_forward", e.to_string()))
 }
 
 #[derive(thiserror::Error, Debug)]

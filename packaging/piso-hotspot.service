@@ -1,30 +1,63 @@
 [Unit]
 Description=piso-hotspot pay-per-usage wifi hotspot
 Documentation=file:///etc/piso-hotspot/config.json
-# The daemon supervises hostapd/dnsmasq and owns firewall state; it
-# must never be restarted while the previous teardown is incomplete.
+# The daemon picks its uplink from the default route at start, so the
+# network has to be up first.
 After=network.target NetworkManager.service
 Wants=NetworkManager.service
-# Never stop on suspend: a suspended host silently stops enforcing the
-# paywall for every associated client.
 RefuseManualStop=no
+# A crash loop must not hammer the radio: three tries, then stay failed
+# until somebody looks. Each retry runs the full cleanup first (#7, #10).
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=forking
-# `start` forks the daemon, waits for it to answer on the control
-# socket, and exits — exactly what Type=forking expects.
+# `start` forks the daemon, waits for the control socket to answer, and
+# exits; systemd then reads the pid file, which the daemon now writes
+# *after* cleaning up a crashed predecessor (#7).
 ExecStart=/usr/bin/piso-hotspot start
 ExecStop=/usr/bin/piso-hotspot stop
+# Whatever happened, finish the teardown: a crashed run leaves helpers,
+# a firewall table and an overridden ip_forward behind (#10).
+ExecStopPost=-/usr/bin/piso-hotspot stop
 PIDFile=/run/piso-hotspot/daemon.pid
-# Teardown must finish even if the supervisor gives up waiting.
 TimeoutStopSec=45
-Restart=no
-# The daemon needs the network stack, not much else.
+# A hotspot that died is worth bringing back; a half-applied teardown is
+# not, which is why the cleanup above runs first.
+Restart=on-failure
+RestartSec=5
+
+# ------------------------------------------------------------------ hardening
+# The daemon runs as root because hostapd, dnsmasq, nft and the portal's
+# port 80 all need capabilities, but nothing beyond those: this is the
+# difference between an RCE in the panel being "the panel" and being the
+# whole machine (#19).
+UMask=0077
+NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
-# It writes /run/piso-hotspot, /etc/piso-hotspot/state.db, and firewall
-# state; protect the rest of the filesystem but not those paths.
-ReadWritePaths=/run/piso-hotspot /etc/piso-hotspot
+ProtectSystem=strict
+# Everything we legitimately write. The `-` prefix means "may not exist
+# yet" — without it, a fresh boot fails with 226/NAMESPACE (#7).
+ReadWritePaths=-/run/piso-hotspot -/etc/piso-hotspot -/etc/ufw -/run/ufw.lock
+# Needed, and deliberately left alone:
+#  - the daemon writes /proc/sys/net/ipv4/ip_forward (ProtectKernelTunables)
+#  - `modprobe ifb` / nf_tables autoload modules (ProtectKernelModules)
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Children inherit this bounding set, so it has to cover everything the
+# daemon drives: nft/ip (NET_ADMIN), hostapd (NET_ADMIN, NET_RAW),
+# dnsmasq's port 53 and the portal's port 80 (NET_BIND_SERVICE),
+# modprobe ifb (SYS_MODULE), and writing our own root-owned files
+# (DAC_OVERRIDE).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_MODULE CAP_DAC_OVERRIDE CAP_CHOWN CAP_KILL CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target

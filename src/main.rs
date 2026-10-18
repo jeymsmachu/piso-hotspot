@@ -7,6 +7,7 @@ mod daemon;
 mod doctor;
 mod http;
 mod iwlist;
+mod keepalive;
 mod leases;
 mod log;
 mod mac;
@@ -254,9 +255,10 @@ fn cmd_list() -> CmdResult {
         return Ok(());
     }
     println!(
-        "{:<18} {:<12} {:<10} {:<17} {:<15} LABEL",
-        "MAC", "STATE", "PASS", "EXPIRES", "IP"
+        "{:<18} {:<12} {:<10} {:<17} {:<15} {:<10} LABEL",
+        "MAC", "STATE", "PASS", "EXPIRES", "IP", "SEEN"
     );
+    let now = daemon::now();
     for d in devices {
         // Labels are operator-controlled free text: escape before they
         // reach a terminal (see `text::sanitize`).
@@ -264,16 +266,28 @@ fn cmd_list() -> CmdResult {
         let expires = d.expires_at.map(fmt_ts).unwrap_or_default();
         let ip = d.ip.clone().unwrap_or_default();
         println!(
-            "{:<18} {:<12} {:<10} {:<17} {:<15} {}",
+            "{:<18} {:<12} {:<10} {:<17} {:<15} {:<10} {}",
             d.mac,
             d.state,
             d.pass_id.as_deref().unwrap_or("-"),
             if expires.is_empty() { "-" } else { &expires },
             if ip.is_empty() { "-" } else { &ip },
+            fmt_ago(now - d.last_seen),
             if label.is_empty() { "-" } else { &label }
         );
     }
     Ok(())
+}
+
+/// "just now", "5m ago", "3h ago", "2d ago": lease age at a glance.
+fn fmt_ago(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 fn cmd_friends() -> CmdResult {
