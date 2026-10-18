@@ -8,8 +8,7 @@ updates:
     groups:
       cargo-low-risk:
         update-types:
-          - minor
-          - patch
+          - version-update:semver-patch
     labels:
       - dependencies
   - package-ecosystem: github-actions
