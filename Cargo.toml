@@ -16,7 +16,7 @@ libc = "0.2"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
-getrandom = "0.3"
+getrandom = "0.4"
 
 [profile.release]
 lto = true
