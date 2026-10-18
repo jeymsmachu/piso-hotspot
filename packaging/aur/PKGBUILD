@@ -3,7 +3,7 @@
 #   git clone https://github.com/jeymsmachu/piso-hotspot.git
 #   cd piso-hotspot/packaging/aur && makepkg -si
 pkgname=piso-hotspot
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Pay-per-usage wifi hotspot: sell timed internet passes, enforced per MAC"
 arch=('x86_64' 'aarch64')

@@ -110,13 +110,14 @@ Then check the machine:
 piso-hotspot doctor
 ```
 
-`doctor` only inspects your system; it changes nothing. It reports the radios it found, whether each supports AP mode (and whether one radio can do client+AP at once), the uplinks it can share, and which modes are available. If no hotspot mode is available, it says what's missing — and exits non-zero, so scripts can rely on it.
+`doctor` only inspects your system; it changes nothing. It reports the radios it found, whether each supports AP mode (and whether one radio can do client+AP at once), the uplinks it can share, and which modes are available. If no hotspot mode is available, it says what's missing — and exits non-zero, so scripts can rely on it. It also validates `config.json` if one exists, so a broken setting is caught before `start` runs.
 
 ## Usage
 
 ### Fire it up
 
 ```bash
+sudo piso-hotspot init     # write a commented /etc/piso-hotspot/config.json (add --force to overwrite)
 sudo piso-hotspot start    # AP + DHCP + paywall, sharing the default route
 sudo piso-hotspot stop     # tear everything down, hand the radio back
 ```
@@ -143,9 +144,9 @@ Several radios or uplinks? Pin them in the config (`ap.interface`, `ap.uplink`) 
 sudo piso-hotspot status
 ```
 
-It prints the mode, the gateway, the panel addresses, and the admin passphrase. The panel answers on the gateway (`http://10.10.0.1:8080`), on the machine itself, and on the uplink address — so a phone on *either* side of the link can run it. Open one of those addresses and sign in.
+It prints the mode, the gateway, the panel addresses, and the admin passphrase. The panel answers on the gateway (`https://10.10.0.1:8080` by default), on the machine itself, and on the uplink address — so a phone on *either* side of the link can run it. Open one of those addresses and sign in.
 
-From the panel you can see devices and active passes, watch traffic and sales, sell passes with one tap, revoke access, rename devices, and give trusted devices free access. The panel is plain HTTP on your local network; treat the passphrase as a local credential, not an internet-facing one.
+From the panel you can see devices and active passes, watch traffic and sales, sell passes with one tap, revoke access, rename devices, give trusted devices free access, and change the network settings. The panel serves **HTTPS by default** (a generated self-signed certificate; browsers show a one-time warning per device), and its login is rate-limited with per-address lockouts; treat the passphrase as a local credential, not an internet-facing one.
 
 If you haven't set an admin passphrase in `/etc/piso-hotspot/config.json`, a fresh one is generated at every start and shown by `sudo piso-hotspot status`.
 
@@ -178,7 +179,11 @@ piso-hotspot --help                            # every command
 
 ## Keeping it running
 
-The daemon survives a closed terminal, so the panel and paywall keep working. **A suspended machine does not:** it drops every connection and stops enforcing the paywall. Disable sleep while the hotspot runs (on AC power), or mask the sleep targets. A systemd unit and more install notes live in [docs/INSTALL.md](docs/INSTALL.md).
+The daemon survives a closed terminal, and it survives suspend: on
+resume it re-asserts the access point and the firewall (clients must
+rejoin the wifi). To avoid even that gap, disable sleep while the
+hotspot runs (on AC power) or mask the sleep targets. A systemd unit
+and more install notes live in [docs/INSTALL.md](docs/INSTALL.md).
 
 If UFW is active, piso-hotspot opens exactly the ports the hotspot needs — DHCP, DNS, portal, and panel — scoped to the AP interface, and removes them at stop. Without that, UFW's INPUT chain silently eats those packets before the paywall rules ever see them.
 
@@ -211,6 +216,8 @@ The full workflow lives in [CONTRIBUTING.md](CONTRIBUTING.md); the short version
 
 ```bash
 cargo test                          # unit tests, no root or hardware needed
+cargo deny check                    # advisories, licences, sources (CI runs this too)
+sudo cargo test netns -- --nocapture # kernel enforcement, in network namespaces (needs root)
 cargo run -- doctor                 # inspect this machine
 ```
 

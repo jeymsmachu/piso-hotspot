@@ -1,6 +1,6 @@
 [package]
 name = "piso-hotspot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Let-chains and edition 2024 need this much; CI builds with the pinned
 # toolchain from rust-toolchain.toml.

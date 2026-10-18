@@ -39,16 +39,21 @@ rules it added, then hands the radio back to NetworkManager.
 
 Notes:
 
-- **Never suspend while the hotspot runs.** A suspended host drops
-  every association and stops enforcing the paywall. Mask sleep targets
-  (`systemctl mask sleep.target suspend.target`) or set the unit's
-  suspend behaviour to refuse.
-- The unit sets `Restart=no` on purpose: a half-applied teardown is
-  worse than a stopped hotspot, and `start` re-runs cleanup for a
-  crashed previous run before it brings anything up.
+- **Suspend kills the wifi session.** A suspended host drops every
+  association. The daemon notices the resume (a wall-clock jump), logs
+  it, re-asserts the access point and the firewall, and the hotspot
+  serves again — but clients have to rejoin the wifi either way. To
+  avoid the gap entirely, mask sleep targets
+  (`systemctl mask sleep.target suspend.target`) while the hotspot runs.
+- The unit sets `Restart=on-failure` with a burst limit: a crashed run
+  is brought back by systemd (after `start` re-ran cleanup for its
+  predecessor), while a crash loop stops after three tries instead of
+  hammering the radio.
 - The panel listens on the gateway address (and the uplink address when
-  one exists); there is no TLS. Treat the admin passphrase as a LAN
-  credential, not an internet one.
+  one exists). It serves HTTPS by default (a generated self-signed
+  certificate; `http` and a certificate file are options in the
+  config). Treat the admin passphrase as a LAN credential, not an
+  internet one.
 
 ## AUR
 
@@ -71,9 +76,10 @@ sudo sqlite3 /etc/piso-hotspot/state.db ".backup /root/piso-state-backup.db"
 ```console
 sudo piso-hotspot stop
 sudo systemctl disable --now piso-hotspot   # if the unit was used
+sudo piso-hotspot wipe-data                 # deletes config, state, unit, run files; asks for confirmation
 sudo rm -f /usr/local/bin/piso-hotspot
-sudo rm -rf /etc/piso-hotspot /etc/systemd/system/piso-hotspot.service
 ```
 
 `stop` already removed every firewall rule, address, and interface the
-program created.
+program created. `wipe-data` never touches the binary itself or files
+in the config directory it did not create.

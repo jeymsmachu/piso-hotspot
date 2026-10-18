@@ -47,9 +47,13 @@ Passes have expiries (`duration_secs`, or until local midnight). Check
 
 ## The laptop suspends and everything dies
 
-A suspended host drops all associations and stops enforcing the
-paywall. Do not sleep while the hotspot runs: on AC power, or
+A suspended host drops all associations. The daemon notices the resume
+(a wall-clock jump) and re-asserts the access point, the paywall and
+the panel; clients have to rejoin the wifi. If even that gap is too
+much, do not sleep while the hotspot runs: on AC power, or
 `systemctl mask sleep.target suspend.target` (see docs/INSTALL.md).
+After a resume, `piso-hotspot status` shows what was re-asserted and
+why.
 
 ## Logs
 

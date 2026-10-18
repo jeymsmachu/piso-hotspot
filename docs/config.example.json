@@ -30,7 +30,8 @@
   },
 
   "admin": {
-    "passphrase": ""
+    "passphrase": "",
+    "tls": "auto"
   },
 
   "portal": {

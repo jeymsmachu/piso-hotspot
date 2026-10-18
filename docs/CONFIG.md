@@ -50,6 +50,8 @@ rendering.
 | Field | Default | Meaning |
 |---|---|---|
 | `passphrase` | `""` | Panel login. Empty generates a random one each start; `piso-hotspot status` prints it. At least 8 characters when set. |
+| `tls` | `auto` | `auto` (generated self-signed HTTPS certificate), `http` (plain), or `file` with `cert_file`/`key_file`. |
+| `bind` | `0.0.0.0` | Address the panel answers on. Narrow it on a network you do not trust. |
 
 ## `portal` and `ui`
 

@@ -363,6 +363,31 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_table_is_replaced_not_trusted() {
+        let fake = FakeNft::new();
+        let fw = firewall(&fake, None);
+        let conn = db("foreign");
+        let device = mac("aa:bb:cc:dd:ee:01");
+        crate::store::grant(&conn, &device, &pass("quick"), NOW, "PHP").unwrap();
+
+        // Somebody else's rules under our name: right name, wrong rules,
+        // zero enforcement. The existence check can't tell, so reconcile
+        // must read the rules and refuse to trust them.
+        *fake.ruleset.lock().unwrap() = Some(
+            "table inet piso {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\taccept\n\t}\n}\n"
+                .to_string(),
+        );
+        let outcome = reconcile(&conn, &fw, NOW, &[]).unwrap();
+        assert!(outcome.report.reinstalled, "a foreign table is not intact");
+        assert_eq!(fake.members(SetName::Allowed), vec![device.to_string()]);
+
+        // And once ours is back, a later tick is quiet again.
+        let again = reconcile(&conn, &fw, NOW + 1, &[]).unwrap();
+        assert!(!again.report.reinstalled);
+        assert!(!again.report.changed());
+    }
+
+    #[test]
     fn an_intact_table_is_left_alone() {
         let fake = FakeNft::new();
         let fw = firewall(&fake, None);
