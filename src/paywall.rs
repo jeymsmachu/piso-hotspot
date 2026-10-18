@@ -291,13 +291,12 @@ pub fn traffic(snapshot: &TableSnapshot, leases: &[LeaseAddress]) -> HashMap<Str
 /// `tests/netns_enforcement.rs`, which needs root.
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use rusqlite::Connection;
 
     use super::*;
-    use crate::nft::{FakeNft, NftBackend, NftError};
+    use crate::nft::{FakeNft, NftBackend};
 
     fn mac(s: &str) -> MacAddr {
         s.parse().unwrap()
