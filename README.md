@@ -206,16 +206,6 @@ cargo test                          # unit tests, no root or hardware needed
 cargo run -- doctor                 # inspect this machine
 ```
 
-The paywall, portal, panel, DHCP, and NAT path are exercised end to end on virtual radios, so the real card is never touched:
-
-```bash
-scripts/hwsim-setup.sh              # once: venv with scapy for the DHCP client
-sudo scripts/hwsim-matrix.sh        # 24 checks, two radios + veth "internet"
-sudo scripts/hwsim-dual-radio.sh    # dual-radio mode, four radios
-```
-
-`piso-smoke.sh` is the interactive hardware counterpart; it refuses to run when the chosen AP interface carries the default route, because that would disconnect the machine mid-test.
-
 ## Credits
 
 Logo built with icons from [Icons8](https://icons8.com): [Hotspot](https://icons8.com/icon/OnFteDC8fjB4/hotspot) and [Peso symbol](https://icons8.com/icon/119775/peso-symbol).
