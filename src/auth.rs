@@ -103,6 +103,16 @@ impl AuthState {
         &self.passphrase
     }
 
+    /// Change the passphrase that works from now on.
+    ///
+    /// Sessions already issued keep working: locking the operator out of
+    /// the panel that just changed the password would be a trap.
+    pub fn set_passphrase(&mut self, passphrase: String) {
+        self.passphrase = passphrase;
+        self.locked.clear();
+        self.failures.clear();
+    }
+
     /// Attempt a login from `addr`. On success, issues a fresh token.
     ///
     /// Two limits protect the passphrase: the per-address lockout, and a

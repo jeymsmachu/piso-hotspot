@@ -6,7 +6,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::config::Config;
+use crate::config::{Config, WifiSecurity};
 
 pub const HOSTAPD_CONF: &str = "/run/piso-hotspot/hostapd.conf";
 pub const DNSMASQ_CONF: &str = "/run/piso-hotspot/dnsmasq.conf";
@@ -52,18 +52,34 @@ pub fn hostapd_config_on_channel(cfg: &Config, iface: &str, channel: u8) -> Stri
     }
     out.push_str(&format!("max_num_sta={}\n", cfg.ap.max_clients));
 
-    if cfg.ap.passphrase.is_empty() {
+    match cfg.ap.security.resolve(&cfg.ap.passphrase) {
         // Open network: the paywall, not the radio password, is the gate.
-        out.push_str("auth_algs=1\n");
-    } else {
-        out.push_str(&format!(
-            "auth_algs=1\n\
-             wpa=2\n\
-             wpa_passphrase={pass}\n\
-             wpa_key_mgmt=WPA-PSK\n\
-             rsn_pairwise=CCMP\n",
-            pass = safe_line(&cfg.ap.passphrase),
-        ));
+        WifiSecurity::Open | WifiSecurity::Auto => {
+            out.push_str("auth_algs=1\n");
+        }
+        WifiSecurity::Wpa2 => {
+            out.push_str(&format!(
+                "auth_algs=1\n\
+                 wpa=2\n\
+                 wpa_passphrase={pass}\n\
+                 wpa_key_mgmt=WPA-PSK\n\
+                 rsn_pairwise=CCMP\n",
+                pass = safe_line(&cfg.ap.passphrase),
+            ));
+        }
+        WifiSecurity::Wpa3 => {
+            // WPA3-SAE, with management frame protection required — which
+            // is the point of choosing it.
+            out.push_str(&format!(
+                "auth_algs=1\n\
+                 wpa=2\n\
+                 sae_password={pass}\n\
+                 wpa_key_mgmt=SAE\n\
+                 rsn_pairwise=CCMP\n\
+                 ieee80211w=2\n",
+                pass = safe_line(&cfg.ap.passphrase),
+            ));
+        }
     }
     // Debug-level syslog: disconnect reasons stay visible.
     out.push_str("logger_syslog_level=0\n");

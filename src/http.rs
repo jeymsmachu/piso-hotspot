@@ -306,6 +306,7 @@ async fn state_payload(
         "devices": devices,
         "friends": friends,
         "audit": audit,
+        "settings": settings_view(&d),
         "passes": d.cfg.passes,
         "currency": d.cfg.currency,
         "theme": serde_json::to_value(d.cfg.ui.theme).unwrap_or_default(),
@@ -322,6 +323,62 @@ async fn state_payload(
         },
     }))
     .into_response()
+}
+
+/// The settings the panel may see.
+///
+/// Everything except the two passphrases: the wifi password is shown as
+/// "set / not set", and the admin passphrase has its own endpoint. This
+/// is the shape the settings form is built from, and the reason the form
+/// can never echo a secret back into the browser.
+fn settings_view(d: &Daemon) -> serde_json::Value {
+    let cfg = &d.cfg;
+    let security = cfg.ap.security.resolve(&cfg.ap.passphrase);
+    json!({
+        "network": {
+            "ssid": cfg.ap.ssid,
+            "security": cfg.ap.security.label(),
+            "effective_security": security.label(),
+            "encrypted": security.is_encrypted(),
+            "passphrase_set": !cfg.ap.passphrase.is_empty(),
+            "channel": cfg.ap.channel,
+            "band": if cfg.ap.channel <= 14 { "2.4" } else { "5" },
+            "max_clients": cfg.ap.max_clients,
+            "isolate_clients": cfg.ap.isolate_clients,
+            "country_code": cfg.ap.country_code,
+            "channel_follows_station": d.mode == "wifi-uplink",
+            "beacon_channel": d.ap_channel,
+        },
+        "limits": {
+            "max_down_bytes_per_sec": cfg.bandwidth.max_down_bytes_per_sec,
+            "max_up_bytes_per_sec": cfg.bandwidth.max_up_bytes_per_sec,
+            "retention_days": cfg.retention_days,
+            "max_friends": cfg.max_friends,
+        },
+        "portal": {
+            "enabled": cfg.portal.enabled,
+            "title": cfg.blocked_page.title,
+            "message": cfg.blocked_page.message,
+            "footer": cfg.blocked_page.footer,
+            "payment_instructions": cfg.blocked_page.payment_instructions,
+            "show_prices": cfg.blocked_page.show_prices,
+        },
+        "panel": {
+            "bind": cfg.admin.bind.to_string(),
+            "port": cfg.ap.port,
+            "tls": cfg.admin.tls.label(),
+            "serving_tls": d.panel_tls.is_some(),
+            "urls": d.panel_urls,
+        },
+        "dns": {
+            "upstream": cfg.upstream_dns,
+            "uses_system_resolvers": cfg.upstream_dns.is_empty(),
+        },
+        "currency": cfg.currency,
+        "theme": serde_json::to_value(cfg.ui.theme).unwrap_or_default(),
+        "mode": d.mode,
+        "repository": "https://github.com/jeymsmachu/piso-hotspot",
+    })
 }
 
 /// The admin passphrase, on demand only.

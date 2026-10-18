@@ -42,6 +42,11 @@ pub enum Request {
         mac: String,
         label: Option<String>,
     },
+    /// Replace settings; fields left out keep their current value. The
+    /// daemon validates, persists, then applies what it can live.
+    SetConfig {
+        patch: Box<crate::config::SettingsPatch>,
+    },
     /// Orderly shutdown (used by `piso-hotspot stop`).
     Shutdown,
 }
@@ -77,6 +82,10 @@ pub struct Response {
     /// Expiry timestamp for a successful grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// What the daemon did and what it means, e.g. "the access point
+    /// restarted; clients must rejoin". Shown by the panel as-is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl Response {
@@ -86,6 +95,7 @@ impl Response {
             error: None,
             status: None,
             expires_at: None,
+            notes: Vec::new(),
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -94,6 +104,14 @@ impl Response {
             error: Some(msg.into()),
             status: None,
             expires_at: None,
+            notes: Vec::new(),
+        }
+    }
+    /// The same answer, with something to tell the operator.
+    pub fn ok_with(notes: Vec<String>) -> Self {
+        Self {
+            notes,
+            ..Self::ok_empty()
         }
     }
 }

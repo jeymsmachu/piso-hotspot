@@ -138,6 +138,14 @@ impl TlsMode {
     pub fn is_tls(self) -> bool {
         !matches!(self, TlsMode::Off)
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TlsMode::Auto => "auto",
+            TlsMode::Off => "off",
+            TlsMode::File => "file",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +193,10 @@ pub struct ApSettings {
     pub ssid: String,
     /// WPA2 passphrase, or empty for an open network. 8–63 characters when set.
     pub passphrase: String,
+    /// Wireless encryption. `auto` (the default) follows the passphrase:
+    /// open when there is none, WPA2 when there is. Betting on
+    /// encryption is a choice, so it is explicit here, not implied.
+    pub security: WifiSecurity,
     /// Radio channel. Ignored in single-radio uplink modes, where the
     /// access point follows the station's channel.
     pub channel: u8,
@@ -207,7 +219,7 @@ pub struct ApSettings {
     pub uplink: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BlockedPage {
     pub title: String,
@@ -217,6 +229,165 @@ pub struct BlockedPage {
     pub payment_instructions: String,
     /// List the configured passes and prices on the portal.
     pub show_prices: bool,
+}
+
+/// A settings change coming from the panel or the API.
+///
+/// Every field is optional: what is left out keeps its current value, so
+/// the panel can submit a form without reloading everything it did not
+/// touch. Unknown fields are refused rather than ignored, so a typo is an
+/// error the operator sees instead of a setting that silently did not
+/// happen.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SettingsPatch {
+    // --- the network ---
+    pub ssid: Option<String>,
+    pub security: Option<WifiSecurity>,
+    pub passphrase: Option<String>,
+    pub channel: Option<u8>,
+    pub max_clients: Option<u8>,
+    pub isolate_clients: Option<bool>,
+    /// `Some(None)` clears it, `Some(Some(code))` sets it, `None` leaves
+    /// it alone.
+    #[serde(default, deserialize_with = "double_option")]
+    pub country_code: Option<Option<String>>,
+    // --- limits and housekeeping ---
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_down_bytes_per_sec: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_up_bytes_per_sec: Option<Option<u64>>,
+    pub retention_days: Option<u32>,
+    pub max_friends: Option<u32>,
+    pub upstream_dns: Option<Vec<Ipv4Addr>>,
+    // --- portal and panel ---
+    pub portal_enabled: Option<bool>,
+    pub blocked_page: Option<BlockedPage>,
+    pub theme: Option<Theme>,
+    pub admin_passphrase: Option<String>,
+}
+
+/// Tell "field absent" from "field explicitly null".
+///
+/// Without this, serde maps a bare `null` in an `Option<Option<T>>` to
+/// the *outer* `None`, which is the same as leaving the field out — so
+/// "unlimited" and "leave my cap alone" would be indistinguishable.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+impl SettingsPatch {
+    /// Overlay this patch onto a configuration. The caller validates the
+    /// result before anything is written or applied.
+    pub fn apply(&self, cfg: &mut Config) {
+        if let Some(value) = &self.ssid {
+            cfg.ap.ssid = value.clone();
+        }
+        if let Some(value) = self.security {
+            cfg.ap.security = value;
+        }
+        if let Some(value) = &self.passphrase {
+            cfg.ap.passphrase = value.clone();
+        }
+        if let Some(value) = self.channel {
+            cfg.ap.channel = value;
+        }
+        if let Some(value) = self.max_clients {
+            cfg.ap.max_clients = value;
+        }
+        if let Some(value) = self.isolate_clients {
+            cfg.ap.isolate_clients = value;
+        }
+        if let Some(value) = &self.country_code {
+            cfg.ap.country_code = value.clone();
+        }
+        if let Some(value) = self.max_down_bytes_per_sec {
+            cfg.bandwidth.max_down_bytes_per_sec = value;
+        }
+        if let Some(value) = self.max_up_bytes_per_sec {
+            cfg.bandwidth.max_up_bytes_per_sec = value;
+        }
+        if let Some(value) = self.retention_days {
+            cfg.retention_days = value;
+        }
+        if let Some(value) = self.max_friends {
+            cfg.max_friends = value;
+        }
+        if let Some(value) = &self.upstream_dns {
+            cfg.upstream_dns = value.clone();
+        }
+        if let Some(value) = self.portal_enabled {
+            cfg.portal.enabled = value;
+        }
+        if let Some(value) = &self.blocked_page {
+            cfg.blocked_page = value.clone();
+        }
+        if let Some(value) = self.theme {
+            cfg.ui.theme = value;
+        }
+        if let Some(value) = &self.admin_passphrase {
+            cfg.admin.passphrase = value.clone();
+        }
+    }
+
+    /// True when the patch would change anything at all.
+    pub fn touches_anything(&self) -> bool {
+        *self != SettingsPatch::default()
+    }
+
+    /// Which settings this patch touches, by name.
+    ///
+    /// Names only, never values: this goes into the audit trail and the
+    /// log, and one of the fields is a passphrase.
+    pub fn describe(&self) -> String {
+        let mut names: Vec<&str> = Vec::new();
+        let note = |set: bool, name: &'static str, names: &mut Vec<&'static str>| {
+            if set {
+                names.push(name);
+            }
+        };
+        note(self.ssid.is_some(), "ssid", &mut names);
+        note(self.security.is_some(), "security", &mut names);
+        note(self.passphrase.is_some(), "wifi passphrase", &mut names);
+        note(self.channel.is_some(), "channel", &mut names);
+        note(self.max_clients.is_some(), "max_clients", &mut names);
+        note(
+            self.isolate_clients.is_some(),
+            "isolate_clients",
+            &mut names,
+        );
+        note(self.country_code.is_some(), "country_code", &mut names);
+        note(
+            self.max_down_bytes_per_sec.is_some(),
+            "download cap",
+            &mut names,
+        );
+        note(
+            self.max_up_bytes_per_sec.is_some(),
+            "upload cap",
+            &mut names,
+        );
+        note(self.retention_days.is_some(), "retention_days", &mut names);
+        note(self.max_friends.is_some(), "max_friends", &mut names);
+        note(self.upstream_dns.is_some(), "upstream_dns", &mut names);
+        note(self.portal_enabled.is_some(), "portal", &mut names);
+        note(self.blocked_page.is_some(), "portal text", &mut names);
+        note(self.theme.is_some(), "theme", &mut names);
+        note(
+            self.admin_passphrase.is_some(),
+            "admin passphrase",
+            &mut names,
+        );
+        if names.is_empty() {
+            "nothing".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
 }
 
 impl Default for Config {
@@ -238,11 +409,54 @@ impl Default for Config {
     }
 }
 
+/// What the radio uses to protect the association.
+///
+/// Encryption protects the *link*, not the internet: everyone still has
+/// to pass the paywall. An open network is easier to join (a captive
+/// portal is the whole product), an encrypted one keeps a neighbour from
+/// reading a paying client's traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WifiSecurity {
+    /// Open when there is no passphrase, WPA2 when there is one.
+    #[default]
+    Auto,
+    Open,
+    Wpa2,
+    Wpa3,
+}
+
+impl WifiSecurity {
+    /// What the radio will actually do, given the configured passphrase.
+    pub fn resolve(self, passphrase: &str) -> WifiSecurity {
+        match self {
+            WifiSecurity::Auto if passphrase.is_empty() => WifiSecurity::Open,
+            WifiSecurity::Auto => WifiSecurity::Wpa2,
+            other => other,
+        }
+    }
+
+    /// True when the resolved choice protects the association.
+    pub fn is_encrypted(self) -> bool {
+        !matches!(self, WifiSecurity::Open)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WifiSecurity::Auto => "auto",
+            WifiSecurity::Open => "open",
+            WifiSecurity::Wpa2 => "wpa2",
+            WifiSecurity::Wpa3 => "wpa3",
+        }
+    }
+}
+
 impl Default for ApSettings {
     fn default() -> Self {
         Self {
             ssid: "piso-hotspot".to_string(),
             passphrase: String::new(),
+            security: WifiSecurity::Auto,
             channel: 6,
             max_clients: 12,
             port: 8080,
@@ -299,6 +513,39 @@ pub fn save(path: &Path, cfg: &Config) -> Result<(), ConfigError> {
 }
 
 impl Config {
+    /// The settings that only take effect when the access point is
+    /// restarted: comparing this before and after an edit is how the
+    /// daemon knows whether clients are about to be dropped.
+    pub fn ap_signature(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{:?}",
+            self.ap.ssid,
+            self.ap.passphrase,
+            self.ap.security.resolve(&self.ap.passphrase).label(),
+            self.ap.channel,
+            self.ap.max_clients,
+            self.ap.isolate_clients,
+            self.ap.country_code
+        )
+    }
+
+    /// The settings the panel server reads once, at start.
+    pub fn panel_signature(&self) -> String {
+        format!(
+            "{}|{}|{}|{:?}|{:?}",
+            self.ap.port,
+            self.admin.bind,
+            self.admin.tls.label(),
+            self.admin.cert_file,
+            self.admin.key_file
+        )
+    }
+
+    /// The settings the captive portal server reads once, at start.
+    pub fn portal_signature(&self) -> String {
+        format!("{}", self.portal.enabled)
+    }
+
     /// Load from `path`, falling back to defaults when the file does not
     /// exist. Returns every problem found, not just the first.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -345,6 +592,27 @@ impl Config {
                 "ap.passphrase must be empty (open network) or 8-63 characters, got {}",
                 self.ap.passphrase.len()
             ));
+        }
+        match self.ap.security.resolve(&self.ap.passphrase) {
+            WifiSecurity::Open => {
+                if !self.ap.passphrase.is_empty() {
+                    problems.push(
+                        "ap.security is \"open\", so ap.passphrase must be empty — \
+                         choose \"wpa2\" or \"wpa3\" to use a password"
+                            .to_string(),
+                    );
+                }
+            }
+            WifiSecurity::Wpa2 | WifiSecurity::Wpa3 => {
+                if self.ap.passphrase.is_empty() {
+                    problems.push(format!(
+                        "ap.security is \"{}\", which needs an ap.passphrase of 8-63 characters",
+                        self.ap.security.label()
+                    ));
+                }
+            }
+            // `resolve` never returns Auto.
+            WifiSecurity::Auto => {}
         }
         // Same line-oriented config, plus WPA2 PSKs are printable ASCII.
         if self
@@ -476,6 +744,90 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_and_passphrase_have_to_agree() {
+        let mut c = Config::default();
+        // The shipped default: auto with no passphrase means an open
+        // network, which is what the project has always started.
+        c.validate().unwrap();
+        assert_eq!(c.ap.security.resolve(&c.ap.passphrase), WifiSecurity::Open);
+
+        // Asking for WPA2 without a passphrase is a mistake worth naming.
+        c.ap.security = WifiSecurity::Wpa2;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("needs an ap.passphrase"), "{err}");
+
+        c.ap.passphrase = "printed-on-a-sign".to_string();
+        c.validate().unwrap();
+        assert_eq!(c.ap.security.resolve(&c.ap.passphrase), WifiSecurity::Wpa2);
+
+        // An open network with a leftover password is contradictory.
+        c.ap.security = WifiSecurity::Open;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("must be empty"), "{err}");
+
+        // `auto` follows the passphrase.
+        c.ap.security = WifiSecurity::Auto;
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn settings_patches_overlay_and_are_strict() {
+        let mut c = Config::default();
+        let patch: SettingsPatch =
+            serde_json::from_str(r#"{"ssid":"Kanto Net","max_friends":3}"#).unwrap();
+        patch.apply(&mut c);
+        assert_eq!(c.ap.ssid, "Kanto Net");
+        assert_eq!(c.max_friends, 3);
+        assert_eq!(c.ap.passphrase, "", "untouched fields keep their value");
+
+        // A typo is an error, not a setting that silently did not happen.
+        assert!(serde_json::from_str::<SettingsPatch>(r#"{"ssdi":"oops"}"#).is_err());
+
+        // "absent" and "explicitly null" are different: one leaves the
+        // cap alone, the other makes it unlimited.
+        let untouched: SettingsPatch = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(untouched.max_down_bytes_per_sec, None);
+        let cleared: SettingsPatch =
+            serde_json::from_str(r#"{"max_down_bytes_per_sec":null}"#).unwrap();
+        assert_eq!(cleared.max_down_bytes_per_sec, Some(None));
+        let limited: SettingsPatch =
+            serde_json::from_str(r#"{"max_down_bytes_per_sec":1000000}"#).unwrap();
+        assert_eq!(limited.max_down_bytes_per_sec, Some(Some(1_000_000)));
+
+        let mut c = Config::default();
+        c.bandwidth.max_down_bytes_per_sec = Some(5_000);
+        cleared.apply(&mut c);
+        assert_eq!(c.bandwidth.max_down_bytes_per_sec, None);
+        limited.apply(&mut c);
+        assert_eq!(c.bandwidth.max_down_bytes_per_sec, Some(1_000_000));
+    }
+
+    #[test]
+    fn signatures_notice_what_needs_a_restart() {
+        let base = Config::default();
+        let mut renamed = base.clone();
+        renamed.ap.ssid = "Kanto Net".to_string();
+        assert_ne!(
+            base.ap_signature(),
+            renamed.ap_signature(),
+            "a new SSID restarts the AP"
+        );
+
+        let mut capped = base.clone();
+        capped.bandwidth.max_down_bytes_per_sec = Some(1_000_000);
+        assert_eq!(
+            base.ap_signature(),
+            capped.ap_signature(),
+            "caps apply live"
+        );
+
+        let mut ported = base.clone();
+        ported.ap.port = 9090;
+        assert_ne!(base.panel_signature(), ported.panel_signature());
+        assert_eq!(base.ap_signature(), ported.ap_signature());
+    }
 
     #[test]
     fn defaults_are_valid() {

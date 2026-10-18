@@ -1359,6 +1359,7 @@ pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) 
                 error: None,
                 expires_at: None,
                 status: Some(status_info(&mut d, now_ts)),
+                notes: Vec::new(),
             }),
             Request::Grant { mac, pass } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
@@ -1394,6 +1395,7 @@ pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) 
                     error: None,
                     status: None,
                     expires_at: Some(expires),
+                    notes: Vec::new(),
                 })
             }
             Request::Revoke { mac } => {
@@ -1470,6 +1472,36 @@ pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) 
                 );
                 Ok(Response::ok_empty())
             }
+            Request::SetConfig { patch } => {
+                let patch = *patch;
+                if !patch.touches_anything() {
+                    return Err("nothing to change".into());
+                }
+                let before = d.cfg.clone();
+                let mut next = before.clone();
+                patch.apply(&mut next);
+                // The same validation `start` applies: the panel is not a
+                // way around the rules.
+                next.validate().map_err(|e| e.to_string())?;
+                // Written before it is applied: a change that is not
+                // persisted would come back as a surprise after a restart.
+                config::save(&config::config_path(), &next).map_err(|e| e.to_string())?;
+                let summary = patch.describe();
+                let notes = apply_settings(&mut d, &before, &next)?;
+                store::record_action(
+                    &d.conn,
+                    now_ts,
+                    "settings",
+                    None,
+                    None,
+                    actor,
+                    Some(&summary),
+                )
+                .map_err(err_str)?;
+                log_info!("settings changed by {actor}: {summary}");
+                d.cfg = next;
+                Ok(Response::ok_with(notes))
+            }
             Request::Shutdown => {
                 store::record_action(&d.conn, now_ts, "shutdown", None, None, actor, None)
                     .map_err(err_str)?;
@@ -1509,6 +1541,123 @@ fn status_info(d: &mut Daemon, now_ts: i64) -> StatusInfo {
         sessions: d.auth.session_count(),
         warnings,
     }
+}
+
+/// What a settings change means, before any of it is done.
+///
+/// Pure on purpose: the interesting part of a settings change is *which*
+/// pieces need the radio restarted, which apply live, and what the
+/// operator should be told — not the filesystem calls around it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SettingsPlan {
+    /// The access point has to restart: clients are dropped.
+    pub restart_ap: bool,
+    /// Bandwidth caps changed and can be applied now.
+    pub apply_caps: bool,
+    /// The admin passphrase changed.
+    pub new_passphrase: bool,
+    /// Panel or portal settings that only a restart picks up.
+    pub restart_required: bool,
+    /// Portal text and theme, which the next page load picks up.
+    pub live_text: bool,
+    /// What changed, in the operator's words.
+    pub notes: Vec<String>,
+}
+
+pub(crate) fn settings_plan(before: &Config, next: &Config) -> SettingsPlan {
+    let mut plan = SettingsPlan {
+        restart_ap: before.ap_signature() != next.ap_signature(),
+        apply_caps: before.bandwidth != next.bandwidth,
+        new_passphrase: before.admin.passphrase != next.admin.passphrase,
+        restart_required: before.panel_signature() != next.panel_signature()
+            || before.portal_signature() != next.portal_signature(),
+        live_text: before.blocked_page != next.blocked_page || before.ui != next.ui,
+        notes: Vec::new(),
+    };
+    if plan.restart_ap {
+        plan.notes.push(
+            "the access point restarted with the new settings: every client has to rejoin".into(),
+        );
+    }
+    if plan.apply_caps {
+        plan.notes.push(
+            if next.bandwidth.max_down_bytes_per_sec.is_none()
+                && next.bandwidth.max_up_bytes_per_sec.is_none()
+            {
+                "bandwidth caps removed".to_string()
+            } else {
+                "bandwidth caps applied to connected clients".to_string()
+            },
+        );
+    }
+    if plan.new_passphrase {
+        plan.notes
+            .push("the admin passphrase changed; open sessions keep working".into());
+    }
+    if before.panel_signature() != next.panel_signature() {
+        plan.notes
+            .push("panel address, port and TLS changes take effect after a restart".into());
+    }
+    if before.portal_signature() != next.portal_signature() {
+        plan.notes
+            .push("enabling or disabling the captive portal takes effect after a restart".into());
+    }
+    if plan.live_text {
+        plan.notes
+            .push("portal text and theme applied to the next page load".into());
+    }
+    plan
+}
+
+/// Make a validated settings change real, as far as it can be without
+/// restarting the daemon. Returns what the operator needs to know.
+fn apply_settings(d: &mut Daemon, before: &Config, next: &Config) -> Result<Vec<String>, String> {
+    let plan = settings_plan(before, next);
+    let notes = plan.notes.clone();
+
+    if plan.restart_ap {
+        // The radio settings only exist inside hostapd's configuration
+        // file, so they take effect by restarting hostapd. In
+        // `--wifi-uplink` the channel belongs to the station, not us.
+        let channel = if d.mode == "wifi-uplink" {
+            d.ap_channel
+        } else {
+            next.ap.channel
+        };
+        fs::write(
+            wireless::HOSTAPD_CONF,
+            wireless::hostapd_config_on_channel(next, &d.fw.ap_iface, channel),
+        )
+        .map_err(|e| format!("writing the hostapd config: {e}"))?;
+        if let Some(mut child) = d.hostapd.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        d.hostapd = Some(
+            supervise("hostapd", &[wireless::HOSTAPD_CONF])
+                .map_err(|e| format!("restarting hostapd: {e}"))?,
+        );
+        expect_alive(&mut d.hostapd, "hostapd")?;
+        record_helper_pids(d);
+    }
+
+    if plan.apply_caps {
+        let caps = shaper::Caps {
+            down: next.bandwidth.max_down_bytes_per_sec,
+            up: next.bandwidth.max_up_bytes_per_sec,
+        };
+        let outcome = if caps.is_unlimited() {
+            shaper::clear(&d.fw.ap_iface).map_err(|e| e.to_string())
+        } else {
+            shaper::apply(&d.fw.ap_iface, caps).map_err(|e| e.to_string())
+        };
+        outcome?;
+    }
+
+    if plan.new_passphrase {
+        d.auth.set_passphrase(next.admin.passphrase.clone());
+    }
+    Ok(notes)
 }
 
 fn err_str(e: impl std::fmt::Display) -> String {
@@ -1874,6 +2023,80 @@ mod tests {
                 .any(|a| a.action == "friend" && a.actor == "cli")
         );
         assert_eq!(crate::store::count_friends(conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn settings_plans_say_what_changes_and_what_it_costs() {
+        let base = Config::default();
+
+        let mut renamed = base.clone();
+        renamed.ap.ssid = "Kanto Net".to_string();
+        let plan = settings_plan(&base, &renamed);
+        assert!(plan.restart_ap, "a new SSID restarts the radio");
+        assert!(!plan.restart_required);
+        assert!(plan.notes.iter().any(|n| n.contains("rejoin")));
+
+        let mut capped = base.clone();
+        capped.bandwidth.max_down_bytes_per_sec = Some(1_000_000);
+        let plan = settings_plan(&base, &capped);
+        assert!(plan.apply_caps && !plan.restart_ap);
+        assert!(plan.notes.iter().any(|n| n.contains("caps applied")));
+
+        let mut unlimited = capped.clone();
+        unlimited.bandwidth.max_down_bytes_per_sec = None;
+        let plan = settings_plan(&capped, &unlimited);
+        assert!(plan.notes.iter().any(|n| n.contains("caps removed")));
+
+        let mut moved = base.clone();
+        moved.ap.port = 9090;
+        let plan = settings_plan(&base, &moved);
+        assert!(plan.restart_required && !plan.restart_ap);
+        assert!(plan.notes.iter().any(|n| n.contains("after a restart")));
+
+        let mut retexted = base.clone();
+        retexted.blocked_page.title = "Bayad muna".to_string();
+        let plan = settings_plan(&base, &retexted);
+        assert!(plan.live_text && !plan.restart_ap && !plan.restart_required);
+    }
+
+    #[test]
+    fn an_invalid_settings_change_never_reaches_the_radio() {
+        let d = offline_daemon("settings-invalid");
+        let patch = crate::config::SettingsPatch {
+            channel: Some(0),
+            ..Default::default()
+        };
+        let resp = dispatch(
+            &d,
+            Request::SetConfig {
+                patch: Box::new(patch),
+            },
+        );
+        assert!(!resp.ok);
+        let err = resp.error.unwrap_or_default();
+        assert!(err.contains("ap.channel must be 1-165"), "{err}");
+        // Nothing was applied in memory, and nothing was recorded as if
+        // it had been.
+        let guard = d.lock().unwrap();
+        assert_eq!(guard.cfg.ap.channel, 6);
+        assert!(
+            crate::store::recent_actions(&guard.conn, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_empty_settings_change_is_rejected_by_name() {
+        let d = offline_daemon("settings-empty");
+        let resp = dispatch(
+            &d,
+            Request::SetConfig {
+                patch: Box::new(crate::config::SettingsPatch::default()),
+            },
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_deref(), Some("nothing to change"));
     }
 
     #[test]
