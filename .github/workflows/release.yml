@@ -1,0 +1,201 @@
+name: Release
+
+# Stable releases come from tags like v0.1.0 and are the only releases
+# `/releases/latest/download/...` resolves to. Nightly is a moving
+# prerelease tag rebuilt on every push to main (and daily, to pick up
+# dependency and toolchain drift).
+#
+# ASSET NAMES ARE A PUBLIC CONTRACT: README and packaging scripts link
+# `/releases/latest/download/<name>` and `/releases/download/nightly/<name>`.
+# Never add version numbers to these names.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_type == 'tag' && github.ref_name || 'nightly' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and package (${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 keeps the glibc floor at 2.35 for both artifacts.
+          - runner: ubuntu-22.04
+            container: ""
+            target: x86_64-unknown-linux-gnu
+            suffix: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+            appimage_arch: x86_64
+          # The arm runner is 24.04; build inside a 22.04 container so
+          # the binary runs on Debian 12 / Ubuntu 22.04 (glibc 2.35).
+          - runner: ubuntu-24.04-arm
+            container: arm64v8/ubuntu:22.04
+            target: aarch64-unknown-linux-gnu
+            suffix: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+            appimage_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+    steps:
+      - name: Install build tools (container image)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git file xz-utils \
+            squashfs-tools zstd cpio
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Assemble raw binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/piso-hotspot" \
+             "dist/piso-hotspot-${{ matrix.target }}"
+          chmod +x "dist/piso-hotspot-${{ matrix.target }}"
+          # Package metadata (Cargo.toml) references target/release; give
+          # it exactly that path regardless of how we built.
+          mkdir -p target/release
+          cp "target/${{ matrix.target }}/release/piso-hotspot" target/release/piso-hotspot
+
+      - name: Install packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build .deb
+        run: |
+          cargo deb --no-build --no-strip \
+            --output "dist/piso-hotspot-${{ matrix.deb_arch }}.deb"
+
+      - name: Build .rpm
+        run: |
+          cargo generate-rpm \
+            --output "dist/piso-hotspot-${{ matrix.rpm_arch }}.rpm"
+
+      - name: Build AppImage
+        env:
+          ARCH: ${{ matrix.appimage_arch }}
+        run: |
+          set -euo pipefail
+          APPDIR=piso-hotspot.AppDir
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp "target/${{ matrix.target }}/release/piso-hotspot" "$APPDIR/usr/bin/"
+          cp packaging/appimage/AppRun "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+          cp packaging/appimage/piso-hotspot.desktop "$APPDIR/"
+          # The logo is a placeholder until the real one lands; replacing
+          # packaging/assets/icon.png is all that is needed.
+          cp packaging/assets/icon.png "$APPDIR/piso-hotspot.png"
+          cp packaging/assets/icon.png "$APPDIR/.DirIcon"
+          cp packaging/assets/icon.png \
+             "$APPDIR/usr/share/icons/hicolor/256x256/apps/piso-hotspot.png"
+          cp packaging/appimage/piso-hotspot.desktop \
+             "$APPDIR/usr/share/applications/"
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x appimagetool
+          # No FUSE on runners: extract and run.
+          ./appimagetool --appimage-extract >/dev/null
+          ./squashfs-root/AppRun "$APPDIR" \
+            "dist/piso-hotspot-${ARCH}.AppImage"
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > "sha256sums-${{ matrix.suffix }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat sha256sums-*.txt | sort -k2 > sha256sums.txt
+          rm -f sha256sums-*.txt
+
+      - name: Publish stable release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Re-runnable: create only when missing, then replace assets.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" \
+                 --generate-notes \
+                 --latest
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            dist/*
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --latest
+
+      - name: Refresh nightly
+        if: github.ref_type == 'branch' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create nightly \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "Nightly build" \
+                 --notes "Built from \`main\`. Expect bugs." \
+                 --prerelease \
+                 --latest=false
+          gh release upload nightly \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            dist/*
+          gh release edit nightly \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes "Built from \`main\` at $(date -u +%Y-%m-%dT%H:%MZ). Expect bugs."

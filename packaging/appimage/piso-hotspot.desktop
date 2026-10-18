@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=piso-hotspot
+Comment=Pay-per-usage wifi hotspot
+Exec=piso-hotspot
+Icon=piso-hotspot
+Terminal=true
+Categories=Network;System;
+Keywords=hotspot;wifi;captive;portal;paywall;

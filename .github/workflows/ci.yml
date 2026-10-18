@@ -23,30 +23,49 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Release build
+        run: cargo build --release --locked
 
-  build:
-    name: Release build (${{ matrix.target }})
-    needs: check
+  # Packaging is verified here (and published by release.yml) so a broken
+  # Cargo.toml metadata block fails on the PR, not at release time.
+  package:
+    name: Package (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+        include:
+          # Ubuntu 22.04 keeps the glibc floor low for the x86-64 artifact.
+          - runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.triple }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross compiler
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-      - uses: actions/upload-artifact@v4
         with:
-          name: piso-hotspot-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/piso-hotspot
+          key: package-${{ matrix.triple }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.triple }}
+      - name: Provide the path package metadata expects
+        run: |
+          mkdir -p target/release
+          cp "target/${{ matrix.triple }}/release/piso-hotspot" target/release/piso-hotspot
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Build packages
+        run: |
+          cargo deb --no-build --no-strip --output /tmp/piso-hotspot.deb
+          cargo generate-rpm --output /tmp/piso-hotspot.rpm
+      - name: Inspect .deb metadata
+        run: |
+          dpkg-deb -I /tmp/piso-hotspot.deb
+          dpkg-deb -c /tmp/piso-hotspot.deb | grep -q 'usr/bin/piso-hotspot'
+          dpkg-deb -I /tmp/piso-hotspot.deb | grep -qE '^ Depends: .*hostapd'
+      - name: Inspect .rpm payload
+        run: |
+          zstd -dc /tmp/piso-hotspot.rpm | cpio -t 2>/dev/null | grep -q 'usr/bin/piso-hotspot'

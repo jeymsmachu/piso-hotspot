@@ -23,3 +23,45 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# ---------------------------------------------------------------- packaging
+# Runtime dependencies for the distribution packages: the daemon shells out
+# to these. Keep in sync with docs/INSTALL.md.
+
+[package.metadata.deb]
+maintainer = "piso-hotspot contributors <jeymsmachu@users.noreply.github.com>"
+copyright = "2026, piso-hotspot contributors"
+license-file = ["LICENSE-MIT", "0", "LICENSE-APACHE", "0"]
+section = "net"
+priority = "optional"
+depends = "$auto, iw, hostapd, dnsmasq, nftables, iproute2"
+extended-description = """\
+Turns a Linux machine with an AP-capable wifi radio into a pay-per-usage
+hotspot. Unpaid devices get a captive portal; passes are sold from the
+admin panel or the command line, and enforcement is per MAC address in
+the kernel firewall.
+The admin panel is served on the hotspot gateway and on the uplink
+address, so a phone on either side can run it."""
+assets = [
+    ["target/release/piso-hotspot", "usr/bin/", "755"],
+    ["packaging/piso-hotspot.service", "usr/lib/systemd/system/", "644"],
+    ["docs/config.example.json", "usr/share/doc/piso-hotspot/", "644"],
+    ["LICENSE-MIT", "usr/share/doc/piso-hotspot/", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/piso-hotspot/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/piso-hotspot", dest = "/usr/bin/piso-hotspot", mode = "755" },
+    { source = "packaging/piso-hotspot.service", dest = "/usr/lib/systemd/system/piso-hotspot.service", mode = "644" },
+    { source = "docs/config.example.json", dest = "/usr/share/doc/piso-hotspot/config.example.json", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/piso-hotspot/LICENSE-MIT", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/piso-hotspot/LICENSE-APACHE", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+iw = "*"
+hostapd = "*"
+dnsmasq = "*"
+nftables = "*"
+iproute = "*"

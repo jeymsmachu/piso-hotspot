@@ -1,0 +1,32 @@
+# Maintainer: Jeyms Machu <jeymsmachu@users.noreply.github.com>
+# Build from the repository at the release tag:
+#   git clone https://github.com/jeymsmachu/piso-hotspot.git
+#   cd piso-hotspot/packaging/aur && makepkg -si
+pkgname=piso-hotspot
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Pay-per-usage wifi hotspot: sell timed internet passes, enforced per MAC"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jeymsmachu/piso-hotspot"
+license=('MIT' 'Apache-2.0')
+depends=('iw' 'hostapd' 'dnsmasq' 'nftables' 'iproute2' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'rust')
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname"
+  cargo build --release --locked --frozen --offline
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/piso-hotspot "$pkgdir/usr/bin/piso-hotspot"
+  install -Dm644 packaging/piso-hotspot.service \
+    "$pkgdir/usr/lib/systemd/system/piso-hotspot.service"
+  install -Dm644 docs/config.example.json \
+    "$pkgdir/usr/share/doc/$pkgname/config.example.json"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

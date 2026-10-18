@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# AppImage entry point: piso-hotspot is a CLI, so just exec it with the
+# caller's arguments. AppImage runtime puts us at $APPDIR/AppRun.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/piso-hotspot" "$@"
