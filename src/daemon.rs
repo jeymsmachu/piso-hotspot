@@ -36,6 +36,10 @@ const PID_FILE: &str = "/run/piso-hotspot/daemon.pid";
 const LOG_FILE: &str = "/run/piso-hotspot/daemon.log";
 const RUNNING_FILE: &str = "/run/piso-hotspot/running.json";
 
+/// Runtime directory: control socket, log, running record, generated
+/// hostapd/dnsmasq configs. Root-only, and everything in it is ours.
+pub(crate) const RUN_DIR: &str = "/run/piso-hotspot";
+
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Set by signals and by "a child died"; the main loop watches it.
@@ -95,7 +99,7 @@ pub fn spawn(opts: Opts) -> Result<(), String> {
         return Err("piso-hotspot is already running (`piso-hotspot status`)".into());
     }
     // The daemon would normally create this; the log lives here too.
-    fs::create_dir_all("/run/piso-hotspot").map_err(|e| format!("cannot create run dir: {e}"))?;
+    fs::create_dir_all(RUN_DIR).map_err(|e| format!("cannot create run dir: {e}"))?;
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
     // A new run rotates the log instead of truncating it: the previous
@@ -155,6 +159,127 @@ pub fn spawn(opts: Opts) -> Result<(), String> {
     ))
 }
 
+/// The lease file as the reconciler needs it: which device holds which
+/// address right now. Download accounting is keyed by address.
+fn lease_addresses() -> Vec<paywall::LeaseAddress> {
+    leases::read(Path::new(wireless::LEASE_FILE))
+        .into_iter()
+        .filter_map(|lease| {
+            let addr = lease.ip.parse().ok()?;
+            Some(paywall::LeaseAddress {
+                mac: lease.mac,
+                addr,
+            })
+        })
+        .collect()
+}
+
+fn cmd_out(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn operstate(iface: &str) -> String {
+    fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// What is wrong right now, in sentences an operator can act on.
+///
+/// `status` used to prove only that the daemon answered its own socket;
+/// this is the part that says whether the access point, the helpers, the
+/// uplink, the panel and the firewall are actually working. An empty
+/// list means the hotspot is doing what it claims.
+///
+/// `live` additionally probes the kernel (a few short commands). `status`
+/// asks for live checks; the reconciler tick stores the cheap ones so
+/// the panel never spawns a process per poll.
+pub(crate) fn health(d: &mut Daemon, live: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Supervised helpers: a dead helper is the difference between
+    // "running" and "working".
+    for (name, child) in [("hostapd", &mut d.hostapd), ("dnsmasq", &mut d.dnsmasq)] {
+        match child {
+            Some(process) => match process.try_wait() {
+                Ok(Some(status)) => warnings.push(format!("{name} has exited ({status})")),
+                Ok(None) => {}
+                Err(e) => warnings.push(format!("{name}: cannot read its state: {e}")),
+            },
+            None => warnings.push(format!("{name} is not started")),
+        }
+    }
+
+    let ap = d.fw.ap_iface.clone();
+    if !Path::new(&format!("/sys/class/net/{ap}")).exists() {
+        warnings.push(format!("access point {ap} no longer exists"));
+    } else {
+        if operstate(&ap) == "down" {
+            warnings.push(format!("access point {ap} is down"));
+        }
+        if live {
+            match cmd_out("iw", &["dev", &ap, "info"]) {
+                Some(info) if info.contains("type AP") => {}
+                Some(_) => warnings.push(format!(
+                    "{ap} is not in AP mode any more (something else took the interface)"
+                )),
+                None => warnings.push(format!("cannot read the state of {ap} (iw failed)")),
+            }
+            let gateway = d.fw.gateway.to_string();
+            match cmd_out("ip", &["-o", "-4", "addr", "show", "dev", &ap]) {
+                Some(addrs) if addrs.contains(&gateway) => {}
+                Some(_) => warnings.push(format!("the gateway address {gateway} is not on {ap}")),
+                None => {}
+            }
+        }
+    }
+
+    if let Some(uplink) = d.fw.uplink.clone() {
+        if operstate(&uplink) == "down" {
+            warnings.push(format!("uplink {uplink} is down"));
+        }
+        if live {
+            if d.mode == "wifi-uplink" {
+                match cmd_out("iw", &["dev", &uplink, "link"]) {
+                    Some(link) if link.contains("Connected") => {}
+                    _ => warnings.push(format!(
+                        "the uplink station {uplink} is not associated; clients have no internet"
+                    )),
+                }
+            }
+            if !doctor::default_route_ifaces().contains(&uplink) {
+                warnings.push(format!("uplink {uplink} does not hold the default route"));
+            }
+        }
+    }
+
+    match &d.last_reconcile {
+        Some(note) if note.error.is_some() => warnings.push(format!(
+            "the last firewall reconcile failed: {}",
+            note.error.as_deref().unwrap_or_default()
+        )),
+        Some(note) => {
+            let age = now() - note.at;
+            if age > 2 * RECONCILE_INTERVAL.as_secs() as i64 {
+                warnings.push(format!("the firewall has not been reconciled for {age}s"));
+            }
+        }
+        None => warnings.push("the firewall reconciler has not run yet".into()),
+    }
+
+    if let Some(e) = &d.panel_error {
+        warnings.push(format!("the admin panel is not serving: {e}"));
+    }
+    if let Some(e) = &d.portal_error {
+        warnings.push(format!("the captive portal is not serving: {e}"));
+    }
+    warnings
+}
+
 fn log_tail() -> String {
     let text = fs::read_to_string(LOG_FILE).unwrap_or_default();
     let chars: Vec<char> = text.chars().collect();
@@ -191,13 +316,7 @@ pub fn stop() -> Result<(), String> {
     }
 
     // Nothing recorded: at most a stale paywall table (ours by name).
-    let stale_fw = Firewall {
-        ap_iface: String::new(),
-        uplink: None,
-        gateway: Ipv4Addr::UNSPECIFIED,
-        panel_port: 0,
-        portal_enabled: false,
-    };
+    let stale_fw = Firewall::system("", None, Ipv4Addr::UNSPECIFIED, 0, false);
     if stale_fw.table_exists() {
         let _ = stale_fw.uninstall();
         println!("piso-hotspot: removed a stale paywall table; interfaces untouched");
@@ -220,14 +339,14 @@ fn cleanup_from_record() {
     let Ok(record) = serde_json::from_str::<RunningRecord>(&text) else {
         return;
     };
-    let fw = Firewall {
-        ap_iface: record.ap_iface.clone(),
-        uplink: record.uplink.clone(),
-        gateway: record.gateway.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
+    let fw = Firewall::system(
+        record.ap_iface.clone(),
+        record.uplink.clone(),
+        record.gateway.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
         // Uninstall never renders; ports are irrelevant here.
-        panel_port: 0,
-        portal_enabled: false,
-    };
+        0,
+        false,
+    );
     let _ = fw.uninstall();
     ufw::close(&record.ap_iface, record.portal_enabled, record.panel_port);
     let _ = shaper::clear(&record.ap_iface);
@@ -265,9 +384,34 @@ pub(crate) struct Daemon {
     pub(crate) panel_urls: Vec<String>,
     /// True when the passphrase was generated (not from config).
     pub(crate) passphrase_generated: bool,
+    /// Per-MAC traffic as the kernel counts it, refreshed by the
+    /// reconciler so the panel never shells out to `nft` per poll.
+    pub(crate) traffic: std::collections::HashMap<String, paywall::Traffic>,
+    /// When `traffic` was refreshed (unix seconds).
+    pub(crate) traffic_at: i64,
+    /// What the last reconcile tick did, and whether it worked: the
+    /// difference between "running" and "enforcing" lives here.
+    pub(crate) last_reconcile: Option<ReconcileNote>,
+    /// Warnings computed by the reconciler tick (`status` recomputes them
+    /// live), so the panel can show them without spawning processes.
+    pub(crate) health: Vec<String>,
+    pub(crate) health_at: i64,
+    /// Why the panel or the portal is not serving, when that happened:
+    /// both are optional services, and a silent failure reads as "the
+    /// panel is down and nothing says why".
+    pub(crate) panel_error: Option<String>,
+    pub(crate) portal_error: Option<String>,
     ip_forward_prev: Option<String>,
     hostapd: Option<Child>,
     dnsmasq: Option<Child>,
+}
+
+/// The outcome of the most recent reconcile tick.
+#[derive(Clone, Debug)]
+pub(crate) struct ReconcileNote {
+    pub at: i64,
+    pub summary: String,
+    pub error: Option<String>,
 }
 
 /// Entry point for the hidden `daemon` subcommand.
@@ -282,13 +426,10 @@ pub fn run(opts: Opts) -> ! {
 }
 
 fn run_inner(opts: Opts) -> Result<(), String> {
-    fs::create_dir_all("/run/piso-hotspot").map_err(|e| e.to_string())?;
+    fs::create_dir_all(RUN_DIR).map_err(|e| e.to_string())?;
     // Root-only from here: the daemon log and run files may hold
     // operational detail, the control socket holds power.
-    let _ = fs::set_permissions(
-        "/run/piso-hotspot",
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    );
+    let _ = fs::set_permissions(RUN_DIR, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     // From here on, operational messages are timestamped and leveled —
     // and land in the same file as hostapd's and dnsmasq's output.
     crate::log::init(Path::new(LOG_FILE));
@@ -337,13 +478,13 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let fw = Firewall {
-        ap_iface: plan.ap_iface.clone(),
-        uplink: plan.uplink.clone(),
-        gateway: plan.gateway,
-        panel_port: cfg.ap.port,
-        portal_enabled: cfg.portal.enabled,
-    };
+    let fw = Firewall::system(
+        plan.ap_iface.clone(),
+        plan.uplink.clone(),
+        plan.gateway,
+        cfg.ap.port,
+        cfg.portal.enabled,
+    );
 
     let (passphrase, passphrase_generated) = if cfg.admin.passphrase.is_empty() {
         (crate::auth::new_passphrase(), true)
@@ -360,6 +501,13 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         auth: crate::auth::AuthState::new(passphrase),
         panel_urls: Vec::new(),
         passphrase_generated,
+        traffic: std::collections::HashMap::new(),
+        traffic_at: 0,
+        last_reconcile: None,
+        health: Vec::new(),
+        health_at: 0,
+        panel_error: None,
+        portal_error: None,
         ip_forward_prev: None,
         hostapd: None,
         dnsmasq: None,
@@ -386,18 +534,25 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     {
         let panel_state = Arc::clone(&daemon);
         std::thread::spawn(move || {
-            if let Err(e) = crate::http::spawn_panel(panel_state, port) {
-                // The paywall and CLI keep working without the panel.
+            if let Err(e) = crate::http::spawn_panel(Arc::clone(&panel_state), port) {
+                // The paywall and CLI keep working without the panel, but
+                // `status` and the log both have to say so.
                 log_error!("panel unavailable: {e}");
+                if let Ok(mut d) = panel_state.lock() {
+                    d.panel_error = Some(e);
+                }
             }
         });
     }
     if portal_enabled {
         let portal_state = Arc::clone(&daemon);
         std::thread::spawn(move || {
-            if let Err(e) = crate::portal::spawn(portal_state, portal_gateway) {
+            if let Err(e) = crate::portal::spawn(Arc::clone(&portal_state), portal_gateway) {
                 // Clients still get internet; they just get no notice page.
                 log_error!("portal unavailable: {e}");
+                if let Ok(mut d) = portal_state.lock() {
+                    d.portal_error = Some(e);
+                }
             }
         });
     }
@@ -792,10 +947,29 @@ fn bring_up(d: &mut Daemon, plan: &Plan) -> Result<(), String> {
     expect_alive(&mut d.hostapd, "hostapd")?;
 
     // Everything is in place: bring the firewall in step with the store.
-    match paywall::reconcile(&d.conn, &d.fw, now()) {
-        Ok(r) if r.changed() => log_info!("initial reconcile: {r:?}"),
-        Ok(_) => {}
-        Err(e) => log_error!("initial reconcile failed: {e}"),
+    let leases = lease_addresses();
+    let now_ts = now();
+    match paywall::reconcile(&d.conn, &d.fw, now_ts, &leases) {
+        Ok(outcome) => {
+            if outcome.report.changed() {
+                log_info!("initial reconcile: {:?}", outcome.report);
+            }
+            d.traffic = paywall::traffic(&outcome.snapshot, &leases);
+            d.traffic_at = now_ts;
+            d.last_reconcile = Some(ReconcileNote {
+                at: now_ts,
+                summary: format!("{:?}", outcome.report),
+                error: None,
+            });
+        }
+        Err(e) => {
+            log_error!("initial reconcile failed: {e}");
+            d.last_reconcile = Some(ReconcileNote {
+                at: now_ts,
+                summary: "failed".into(),
+                error: Some(e.to_string()),
+            });
+        }
     }
     Ok(())
 }
@@ -914,14 +1088,14 @@ pub(crate) fn dispatch(d: &Arc<Mutex<Daemon>>, req: Request) -> Response {
 /// nothing, so they are not recorded — but they are logged.
 pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) -> Response {
     let result = (|| -> Result<Response, String> {
-        let d = d.lock().map_err(|_| "state poisoned".to_string())?;
+        let mut d = d.lock().map_err(|_| "state poisoned".to_string())?;
         let now_ts = now();
         match req {
             Request::Status => Ok(Response {
                 ok: true,
                 error: None,
                 expires_at: None,
-                status: Some(status_info(&d, now_ts)?),
+                status: Some(status_info(&mut d, now_ts)),
             }),
             Request::Grant { mac, pass } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
@@ -1039,19 +1213,25 @@ pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) 
 
 /// The snapshot `status` and the panel report. Kept in one place so both
 /// lanes answer the same way.
-fn status_info(d: &Daemon, now_ts: i64) -> Result<StatusInfo, String> {
-    Ok(StatusInfo {
+///
+/// This asks the machine what is true (`health(.., true)`) instead of
+/// repeating what the daemon believes: the point of `status` is to
+/// notice when the two disagree.
+fn status_info(d: &mut Daemon, now_ts: i64) -> StatusInfo {
+    let warnings = health(d, true);
+    StatusInfo {
         mode: d.mode.clone(),
         ap_iface: d.fw.ap_iface.clone(),
         uplink: d.fw.uplink.clone(),
         gateway: d.fw.gateway.to_string(),
         started_at: d.started_at,
-        devices_seen: store::count_devices(&d.conn).map_err(err_str)?,
-        active_passes: store::count_active_passes(&d.conn, now_ts).map_err(err_str)?,
+        devices_seen: store::count_devices(&d.conn).unwrap_or(0),
+        active_passes: store::count_active_passes(&d.conn, now_ts).unwrap_or(0),
         panel_urls: d.panel_urls.clone(),
         admin_passphrase: d.auth.passphrase().to_string(),
         sessions: d.auth.session_count(),
-    })
+        warnings,
+    }
 }
 
 fn err_str(e: impl std::fmt::Display) -> String {
@@ -1067,13 +1247,41 @@ fn spawn_reconciler(d: Arc<Mutex<Daemon>>) {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 return;
             }
-            let Ok(d) = d.lock() else { return };
+            let Ok(mut d) = d.lock() else { return };
             let now_ts = now();
-            match paywall::reconcile(&d.conn, &d.fw, now_ts) {
-                Ok(r) if r.changed() => log_info!("reconcile: {r:?}"),
-                Ok(_) => {}
-                Err(e) => log_error!("reconcile failed: {e}"),
+            let leases = lease_addresses();
+            match paywall::reconcile(&d.conn, &d.fw, now_ts, &leases) {
+                Ok(outcome) => {
+                    if outcome.report.reinstalled {
+                        log_warn!(
+                            "enforcement was not in place (missing, flushed, or foreign \
+                             table); reinstalled the paywall"
+                        );
+                    }
+                    if outcome.report.changed() {
+                        log_info!("reconcile: {:?}", outcome.report);
+                    }
+                    d.traffic = paywall::traffic(&outcome.snapshot, &leases);
+                    d.traffic_at = now_ts;
+                    d.last_reconcile = Some(ReconcileNote {
+                        at: now_ts,
+                        summary: format!("{:?}", outcome.report),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    log_error!("reconcile failed: {e}");
+                    d.last_reconcile = Some(ReconcileNote {
+                        at: now_ts,
+                        summary: "failed".into(),
+                        error: Some(e.to_string()),
+                    });
+                }
             }
+            // Cheap health checks ride along with the tick, so `status`
+            // and the panel can report them without probing anything.
+            d.health = health(&mut d, false);
+            d.health_at = now_ts;
             for lease in leases::read(Path::new(wireless::LEASE_FILE)) {
                 if let Err(e) =
                     store::touch_leased_device(&d.conn, &lease.mac, Some(&lease.ip), now_ts)
@@ -1289,18 +1497,19 @@ mod tests {
         Arc::new(Mutex::new(Daemon {
             cfg: Config::default(),
             conn,
-            fw: Firewall {
-                ap_iface: "wlan0".into(),
-                uplink: None,
-                gateway: Ipv4Addr::new(10, 10, 0, 1),
-                panel_port: 8080,
-                portal_enabled: true,
-            },
+            fw: Firewall::system("wlan0", None, Ipv4Addr::new(10, 10, 0, 1), 8080, true),
             mode: "offline".into(),
             started_at: 0,
             auth: crate::auth::AuthState::new("test-passphrase".into()),
             panel_urls: Vec::new(),
             passphrase_generated: true,
+            traffic: std::collections::HashMap::new(),
+            traffic_at: 0,
+            last_reconcile: None,
+            health: Vec::new(),
+            health_at: 0,
+            panel_error: None,
+            portal_error: None,
             ip_forward_prev: None,
             hostapd: None,
             dnsmasq: None,

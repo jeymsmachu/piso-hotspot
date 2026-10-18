@@ -10,6 +10,7 @@ mod iwlist;
 mod leases;
 mod log;
 mod mac;
+mod netns;
 mod nft;
 mod passes;
 mod paywall;
@@ -22,11 +23,16 @@ mod ufw;
 mod viface;
 mod wireless;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use config::Config;
 use control::Request;
+
+/// Where the packaged systemd unit lives, for `wipe-data`.
+const SYSTEMD_UNIT: &str = "/etc/systemd/system/piso-hotspot.service";
 
 #[derive(Parser)]
 #[command(name = "piso-hotspot", version, about = "Pay-per-usage wifi hotspot")]
@@ -71,6 +77,19 @@ enum Command {
         #[arg(long, default_value_t = 25)]
         limit: u32,
     },
+    /// Create the configuration file with the current defaults.
+    Init {
+        /// Overwrite an existing configuration file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete everything this program created: configuration, state,
+    /// systemd unit, run files. Asks for confirmation first.
+    WipeData {
+        /// Skip the confirmation prompt (for scripts).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Sell a pass: grant <mac> <quick|extended|...>.
     Grant { mac: String, pass: String },
     /// Cut a device off (keeps its wifi association).
@@ -105,6 +124,8 @@ fn main() -> ExitCode {
         Command::List => cmd_list(),
         Command::Friends => cmd_friends(),
         Command::Audit { limit } => cmd_audit(limit),
+        Command::Init { force } => cmd_init(force),
+        Command::WipeData { yes } => cmd_wipe_data(yes),
         Command::Grant { mac, pass } => cmd_grant(mac, pass),
         Command::Revoke { mac } => cmd_revoke(mac),
         Command::Friend { mac, label } => cmd_friend(mac, label),
@@ -214,6 +235,15 @@ fn cmd_status() -> CmdResult {
         "  admin passphrase: {}",
         text::sanitize(&s.admin_passphrase)
     );
+    if s.warnings.is_empty() {
+        println!("  health:     ok");
+    } else {
+        println!("  health:");
+        for warning in &s.warnings {
+            // Warnings quote interfaces and error text: escape them too.
+            println!("    - {}", text::sanitize(warning));
+        }
+    }
     Ok(())
 }
 
@@ -290,6 +320,118 @@ fn cmd_audit(limit: u32) -> CmdResult {
     Ok(())
 }
 
+fn cmd_init(force: bool) -> CmdResult {
+    if !doctor::is_root() {
+        return Err("init writes into the config directory (try: sudo piso-hotspot init)".into());
+    }
+    let path = config::config_path();
+    if path.exists() && !force {
+        return Err(format!(
+            "{} already exists — edit it, or pass --force to replace it with the defaults",
+            path.display()
+        ));
+    }
+    let cfg = Config::default();
+    config::save(&path, &cfg).map_err(|e| e.to_string())?;
+    println!("wrote {}", path.display());
+    println!();
+    println!("next:");
+    println!("  edit it (name, passwords, prices, caps)");
+    println!("  `piso-hotspot doctor` checks it without changing anything");
+    println!("  `sudo piso-hotspot start` runs the hotspot");
+    Ok(())
+}
+
+/// What `wipe-data` deletes, in the order it deletes it.
+///
+/// Separate from the deletion so the list can be printed before anything
+/// happens, and so a test can prove what is *not* on it: the binary, the
+/// repository, and anything the operator put in the config directory.
+fn wipe_paths(config_dir: &Path, unit: &Path, run_dir: &Path) -> Vec<PathBuf> {
+    let state = config_dir.join(config::STATE_FILE);
+    let mut paths = vec![config_dir.join(config::CONFIG_FILE), state.clone()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = state.clone().into_os_string();
+        sidecar.push(suffix);
+        paths.push(PathBuf::from(sidecar));
+    }
+    paths.push(unit.to_path_buf());
+    paths.push(run_dir.to_path_buf());
+    paths
+}
+
+/// Delete what exists, and report exactly that.
+fn remove_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for path in paths {
+        let outcome = if path.is_dir() {
+            // The run directory holds only what the daemon wrote.
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if outcome.is_ok() {
+            removed.push(path.clone());
+        }
+    }
+    removed
+}
+
+fn cmd_wipe_data(yes: bool) -> CmdResult {
+    if !doctor::is_root() {
+        return Err("wipe-data must run as root (try: sudo piso-hotspot wipe-data)".into());
+    }
+    if control::alive() {
+        return Err(
+            "the hotspot is running — `sudo piso-hotspot stop` first, so the radio and the \
+             firewall are handed back before the state is gone"
+                .into(),
+        );
+    }
+    let config_dir = config::config_dir();
+    let paths = wipe_paths(
+        &config_dir,
+        Path::new(SYSTEMD_UNIT),
+        Path::new(daemon::RUN_DIR),
+    );
+
+    println!("this deletes:");
+    for path in &paths {
+        println!("  {}", path.display());
+    }
+    println!();
+    println!("it does not touch the binary, the repository, or other packages' files.");
+    if !yes {
+        println!("if the hotspot was active recently, run `sudo piso-hotspot stop` first.");
+        print!("type `wipe` to confirm: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if answer.trim() != "wipe" {
+            return Err("nothing was deleted".into());
+        }
+    }
+
+    let removed = remove_paths(&paths);
+    for path in &removed {
+        println!("removed {}", path.display());
+    }
+    // The config directory itself goes only if nothing else lives there.
+    if config_dir.exists() && std::fs::read_dir(&config_dir).is_ok_and(|d| d.count() == 0) {
+        let _ = std::fs::remove_dir(&config_dir);
+    }
+    if removed.is_empty() {
+        println!("nothing was there to delete");
+    }
+    println!();
+    println!("note: a package-managed unit in /usr/lib/systemd/system belongs to the");
+    println!("package manager — remove it with your package manager, not here.");
+    println!("`sudo systemctl daemon-reload` forgets the unit we did remove.");
+    Ok(())
+}
+
 fn cmd_grant(mac: String, pass: String) -> CmdResult {
     let resp = control::request(&Request::Grant {
         mac: mac.clone(),
@@ -363,4 +505,111 @@ fn fmt_ts(ts: i64) -> String {
         .with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_leaves_the_binary_the_repo_and_siblings_alone() {
+        let config_dir = Path::new("/etc/piso-hotspot");
+        let run_dir = Path::new("/run/piso-hotspot");
+        let unit = Path::new("/etc/systemd/system/piso-hotspot.service");
+        let paths = wipe_paths(config_dir, unit, run_dir);
+
+        // Exactly what we created: config, state and its SQLite sidecars,
+        // the unit, the run directory.
+        for expected in [
+            "/etc/piso-hotspot/config.json",
+            "/etc/piso-hotspot/state.db",
+            "/etc/piso-hotspot/state.db-wal",
+            "/etc/piso-hotspot/state.db-shm",
+            "/etc/piso-hotspot/state.db-journal",
+            "/etc/systemd/system/piso-hotspot.service",
+            "/run/piso-hotspot",
+        ] {
+            assert!(
+                paths.contains(&PathBuf::from(expected)),
+                "missing {expected} from {paths:?}"
+            );
+        }
+        assert_eq!(paths.len(), 7, "nothing else is on the list: {paths:?}");
+        // Nothing under the binary's own location, and no directories we
+        // do not own.
+        for path in &paths {
+            let text = path.display().to_string();
+            for forbidden in [
+                "/usr/bin",
+                "/usr/lib",
+                "/etc/systemd/system/network",
+                "/home/",
+            ] {
+                assert!(!text.starts_with(forbidden), "{text} must not be wiped");
+            }
+        }
+    }
+
+    #[test]
+    fn removal_reports_what_it_deleted_and_touches_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("piso-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join("etc");
+        let run_dir = dir.join("run");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(config_dir.join("config.json"), "{}").unwrap();
+        std::fs::write(config_dir.join("state.db"), "").unwrap();
+        std::fs::write(config_dir.join("notes.txt"), "the operator's own file").unwrap();
+        std::fs::write(run_dir.join("daemon.log"), "log").unwrap();
+        let unit = dir.join("piso-hotspot.service");
+        std::fs::write(&unit, "unit").unwrap();
+
+        let paths = wipe_paths(&config_dir, &unit, &run_dir);
+        let removed = remove_paths(&paths);
+        assert!(removed.contains(&config_dir.join("config.json")));
+        assert!(removed.contains(&config_dir.join("state.db")));
+        assert!(removed.contains(&unit));
+        assert!(removed.contains(&run_dir), "the run directory goes whole");
+        assert!(!run_dir.exists());
+        assert!(
+            config_dir.join("notes.txt").exists(),
+            "files we did not create survive"
+        );
+        assert!(!paths.contains(&config_dir.join("notes.txt")));
+
+        // Nothing left to delete the second time around.
+        assert!(remove_paths(&paths).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_written_config_loads_back_and_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("piso-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        let defaults = Config::default();
+        config::save(&path, &defaults).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded, defaults, "what we write is what we read back");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the file holds passphrases"
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // The written file must be accepted by the same validation the
+        // daemon applies.
+        loaded.validate().unwrap();
+        // A second write replaces it without leaving the temporary behind.
+        config::save(&path, &loaded).unwrap();
+        assert!(!path.with_extension("json.new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

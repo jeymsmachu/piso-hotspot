@@ -200,6 +200,10 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 // ------------------------------------------------------------------ api data
 
 /// Everything the panel needs for one render, under one authed request.
+///
+/// The numbers come from the daemon's last reconciler tick, never from a
+/// fresh `nft` call: a dashboard open on three phones must not run the
+/// kernel's rule dump three times every three seconds.
 async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Response {
     if let Some(resp) = auth_error(&state, &headers) {
         return resp;
@@ -213,33 +217,30 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
     let revenue = crate::store::revenue_since(&d.conn, today_start).unwrap_or((0, 0));
     let devices = crate::store::list_devices(&d.conn).unwrap_or_default();
     let friends = crate::store::list_friends(&d.conn).unwrap_or_default();
+    let audit = crate::store::recent_actions(&d.conn, 25).unwrap_or_default();
 
-    // Live kernel counters: aggregate per set plus per-MAC, so the
-    // dashboard can derive rates client-side between polls.
-    let allowed_elems =
-        d.fw.set_members(crate::nft::SET_ALLOWED)
-            .unwrap_or_default();
-    let friend_elems =
-        d.fw.set_members(crate::nft::SET_FRIENDS)
-            .unwrap_or_default();
-    let blocked_elems =
-        d.fw.set_members(crate::nft::SET_BLOCKED)
-            .unwrap_or_default();
+    // Per-device traffic, up and down, from the kernel's own counters.
     let mut by_mac = serde_json::Map::new();
-    for set in [&allowed_elems, &friend_elems, &blocked_elems] {
-        for el in set {
-            by_mac.insert(
-                el.mac.to_string(),
-                json!({ "packets": el.packets, "bytes": el.bytes }),
-            );
-        }
+    let mut up = (0u64, 0u64);
+    let mut down = (0u64, 0u64);
+    let mut blocked = (0u64, 0u64);
+    for (mac, t) in &d.traffic {
+        by_mac.insert(
+            mac.clone(),
+            json!({
+                "up_packets": t.up_packets,
+                "up_bytes": t.up_bytes,
+                "down_packets": t.down_packets,
+                "down_bytes": t.down_bytes,
+                "blocked_packets": t.blocked_packets,
+                "blocked_bytes": t.blocked_bytes,
+            }),
+        );
+        up = (up.0 + t.up_packets, up.1 + t.up_bytes);
+        down = (down.0 + t.down_packets, down.1 + t.down_bytes);
+        blocked = (blocked.0 + t.blocked_packets, blocked.1 + t.blocked_bytes);
     }
-    let totals = |v: &[crate::nft::SetElement]| {
-        json!({
-            "packets": v.iter().map(|e| e.packets).sum::<u64>(),
-            "bytes": v.iter().map(|e| e.bytes).sum::<u64>(),
-        })
-    };
+    let counter = |(packets, bytes): (u64, u64)| json!({ "packets": packets, "bytes": bytes });
 
     Json(json!({
         "status": {
@@ -254,19 +255,30 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
             "sessions": d.auth.session_count(),
             "passphrase_source": if d.passphrase_generated { "generated" } else { "config" },
             "version": env!("CARGO_PKG_VERSION"),
+            "warnings": d.health,
+            "health_at": d.health_at,
+            "last_reconcile": d.last_reconcile.as_ref().map(|note| json!({
+                "at": note.at,
+                "summary": note.summary,
+                "error": note.error,
+            })),
         },
         "devices": devices,
         "friends": friends,
+        "audit": audit,
         "passes": d.cfg.passes,
         "currency": d.cfg.currency,
         "theme": serde_json::to_value(d.cfg.ui.theme).unwrap_or_default(),
         "revenue_today": { "total_minor": revenue.0, "count": revenue.1 },
         "caps": d.cfg.bandwidth,
         "traffic": {
-            "allowed": totals(&allowed_elems),
-            "friends": totals(&friend_elems),
-            "blocked": totals(&blocked_elems),
+            "up": counter(up),
+            "down": counter(down),
+            "blocked": counter(blocked),
             "by_mac": by_mac,
+            // When the kernel numbers were read: a panel that shows
+            // rates has to know.
+            "measured_at": d.traffic_at,
         },
     }))
     .into_response()

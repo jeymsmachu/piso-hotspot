@@ -21,8 +21,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # The toolchain comes from rust-toolchain.toml; the action only
+      # installs it (components included) and caches it for the run.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.98.1
         with:
+          toolchain: "1.98.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
@@ -33,6 +36,73 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+
+  # Dependency advisories, licences, and registry hygiene. The policy is
+  # in deny.toml: a yanked crate or an unknown source fails the build.
+  deny:
+    name: Dependencies (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [advisories, licenses, bans, sources]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny ${{ matrix.check }}
+        run: cargo deny check ${{ matrix.check }}
+
+  # The prompt says "the paywall must fail closed". This is the only job
+  # that can prove it: a real kernel, real nftables, real traffic, inside
+  # throwaway network namespaces.
+  kernel:
+    name: Kernel enforcement (namespaces)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.98.1
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: kernel-${{ github.ref }}
+      - name: Install the tools the daemon drives
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nftables iproute2 iputils-ping
+      # Built as the runner user, then executed as root: running cargo
+      # itself under sudo would leave root-owned files in target/.
+      - name: Build the test binary
+        run: cargo test --locked --no-run
+      - name: Run the namespace test as root
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.target.name == "piso-hotspot") | .executable // empty' \
+            | tail -1 > /tmp/piso-test-bin
+          BIN="$(cat /tmp/piso-test-bin)"
+          test -x "$BIN"
+          sudo "$BIN" netns --nocapture --test-threads=1
+
+  # Secrets never belong in a repository; this fails the build when one
+  # is committed, before it reaches a release artifact.
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: gitleaks
+      - name: Scan the history
+        run: gitleaks detect --source . --redact --verbose --exit-code 1
 
   # Packaging is verified here (and published by release.yml) so a broken
   # Cargo.toml metadata block fails on the PR, not at release time.
@@ -51,8 +121,9 @@ jobs:
             triple: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.98.1
         with:
+          toolchain: "1.98.1"
           targets: ${{ matrix.triple }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -86,7 +157,7 @@ jobs:
           assert data[:4] == b"\xed\xab\xee\xdb", "not an rpm"
           i = data.find(b"\x28\xb5\x2f\xfd")  # zstd (generate-rpm default)
           if i >= 0:
-              import io, subprocess
+              import subprocess
               p = subprocess.run(["zstd", "-dc"], input=data[i:],
                                  capture_output=True)
               if p.returncode != 0:

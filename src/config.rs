@@ -206,6 +206,37 @@ impl Default for BlockedPage {
     }
 }
 
+/// Write `cfg` to `path` (atomically, root-only).
+///
+/// The file holds the wifi and admin passphrases, so it is written 0600
+/// into a 0700 directory, through a temporary file in the same
+/// directory: a half-written config would take the hotspot down.
+pub fn save(path: &Path, cfg: &Config) -> Result<(), ConfigError> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(|source| ConfigError::Read {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+
+    let mut text = serde_json::to_string_pretty(cfg).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    text.push('\n');
+    let temp = path.with_extension("json.new");
+    fs::write(&temp, text).map_err(|source| ConfigError::Read {
+        path: temp.clone(),
+        source,
+    })?;
+    let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o600));
+    fs::rename(&temp, path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 impl Config {
     /// Load from `path`, falling back to defaults when the file does not
     /// exist. Returns every problem found, not just the first.

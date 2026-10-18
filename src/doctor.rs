@@ -537,7 +537,7 @@ pub fn print_human(report: &Report) {
         if report.state.config_exists {
             ""
         } else {
-            " (not created yet; defaults apply)"
+            " (not created yet; defaults apply — `sudo piso-hotspot init` writes one)"
         }
     );
     if let Some(err) = &report.state.config_error {

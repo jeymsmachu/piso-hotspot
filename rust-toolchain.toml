@@ -1,0 +1,7 @@
+# The compiler this project is built with, pinned so a release is
+# reproducible and so CI and contributors see the same warnings.
+# Update deliberately, not by drifting with `stable`.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

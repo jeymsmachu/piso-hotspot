@@ -2,6 +2,9 @@
 name = "piso-hotspot"
 version = "0.1.0"
 edition = "2024"
+# Let-chains and edition 2024 need this much; CI builds with the pinned
+# toolchain from rust-toolchain.toml.
+rust-version = "1.88"
 description = "Pay-per-usage wifi hotspot"
 repository = "https://github.com/jeymsmachu/piso-hotspot"
 license = "MIT OR Apache-2.0"

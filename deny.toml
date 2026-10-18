@@ -1,0 +1,39 @@
+# cargo-deny policy: dependency advisories, licences, and where crates
+# may come from. Run with `cargo deny check` (CI runs it on every push).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# A yanked crate in the lockfile is a supply-chain problem, not a
+# stylistic one.
+yanked = "deny"
+# No exceptions: nothing here is knowingly affected.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The licences this project's dependency tree actually uses. Anything new
+# has to be added here on purpose, by whoever adds the dependency.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The tooling this project shells out to is a runtime dependency; cargo
+# dependencies stay few and boring on purpose.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

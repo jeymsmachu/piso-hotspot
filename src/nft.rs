@@ -7,9 +7,11 @@
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::log_warn;
 use crate::mac::MacAddr;
 
 /// Set names used by the ruleset.
@@ -19,6 +21,13 @@ pub const SET_FRIENDS: &str = "friends";
 /// exists so per-device drop counters can attribute "bandwidth eaten
 /// by waiting devices".
 pub const SET_BLOCKED: &str = "blocked";
+/// The same idea for the download direction, keyed by the address a
+/// client currently holds: by the time a packet is being forwarded *to*
+/// a client, its destination MAC is this machine's, so MAC matching
+/// cannot see it. These sets are accounting and attribution — they
+/// never *grant* anything.
+pub const SET_ALLOWED_V4: &str = "allowed_v4";
+pub const SET_BLOCKED_V4: &str = "blocked_v4";
 
 /// One member of a counter-enabled set as printed by `nft list set`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +35,45 @@ pub struct SetElement {
     pub mac: MacAddr,
     pub packets: u64,
     pub bytes: u64,
+}
+
+/// One address member of a v4 set, with its counters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V4Element {
+    pub addr: Ipv4Addr,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+/// Every set of our table, in one read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableSnapshot {
+    pub allowed: Vec<SetElement>,
+    pub friends: Vec<SetElement>,
+    pub blocked: Vec<SetElement>,
+    pub allowed_v4: Vec<V4Element>,
+    pub blocked_v4: Vec<V4Element>,
+}
+
+impl TableSnapshot {
+    /// MAC members of one of the address sets; empty for v4 sets.
+    pub fn macs(&self, set: SetName) -> &[SetElement] {
+        match set {
+            SetName::Allowed => &self.allowed,
+            SetName::Friends => &self.friends,
+            SetName::Blocked => &self.blocked,
+            SetName::AllowedV4 | SetName::BlockedV4 => &[],
+        }
+    }
+
+    /// Address members of one of the v4 sets; empty for MAC sets.
+    pub fn addresses(&self, set: SetName) -> &[V4Element] {
+        match set {
+            SetName::AllowedV4 => &self.allowed_v4,
+            SetName::BlockedV4 => &self.blocked_v4,
+            _ => &[],
+        }
+    }
 }
 
 pub const TABLE: &str = "piso";
@@ -56,6 +104,42 @@ fn validate_iface(name: &str) -> Result<&str, NftError> {
     }
 }
 
+/// Everything the paywall asks of the kernel goes through one trait, so
+/// the reconciler can be exercised against a fake kernel (unit tests)
+/// or a real one inside a network namespace (integration tests) rather
+/// than against whatever the developer's laptop happens to have loaded.
+pub trait NftBackend: Send + Sync {
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, NftError>;
+}
+
+/// The real thing: the `nft` binary.
+pub struct SystemNft;
+
+impl NftBackend for SystemNft {
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, NftError> {
+        let mut child = Command::new("nft")
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(input) = stdin {
+            let mut pipe = child.stdin.take().expect("piped");
+            pipe.write_all(input.as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            return Err(NftError::Rejected(stderr.trim().to_string()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
 pub struct Firewall {
     /// Interface carrying the hotspot's clients.
     pub ap_iface: String,
@@ -68,9 +152,48 @@ pub struct Firewall {
     pub panel_port: u16,
     /// Serve the captive portal on port 80 to clients.
     pub portal_enabled: bool,
+    backend: Arc<dyn NftBackend>,
 }
 
 impl Firewall {
+    /// A firewall that talks to this machine's kernel.
+    pub fn system(
+        ap_iface: impl Into<String>,
+        uplink: Option<String>,
+        gateway: Ipv4Addr,
+        panel_port: u16,
+        portal_enabled: bool,
+    ) -> Self {
+        Self {
+            ap_iface: ap_iface.into(),
+            uplink,
+            gateway,
+            panel_port,
+            portal_enabled,
+            backend: Arc::new(SystemNft),
+        }
+    }
+
+    /// Same, with a caller-supplied kernel (tests).
+    #[cfg(test)]
+    pub(crate) fn with_backend(
+        backend: Arc<dyn NftBackend>,
+        ap_iface: impl Into<String>,
+        uplink: Option<String>,
+        gateway: Ipv4Addr,
+        panel_port: u16,
+        portal_enabled: bool,
+    ) -> Self {
+        Self {
+            ap_iface: ap_iface.into(),
+            uplink,
+            gateway,
+            panel_port,
+            portal_enabled,
+            backend,
+        }
+    }
+
     /// The client subnet in network form (gateway masked to /24).
     fn client_subnet(&self) -> String {
         let octets = self.gateway.octets();
@@ -123,9 +246,23 @@ impl Firewall {
         type ether_addr
         counter
     }}
+    set {SET_ALLOWED_V4} {{
+        type ipv4_addr
+        counter
+    }}
+    set {SET_BLOCKED_V4} {{
+        type ipv4_addr
+        counter
+    }}
 
     chain forward {{
         type filter hook forward priority filter; policy accept;
+        # Downloads are attributed by the address the client holds: the
+        # frame's destination MAC belongs to this machine by now, so the
+        # client's own MAC is not in the packet any more. The allow-set
+        # rule counts and falls through; it grants nothing.
+        ip daddr @{SET_BLOCKED_V4} counter drop
+        ip daddr @{SET_ALLOWED_V4} counter
         # Traffic that does not pass through the hotspot is not ours to police.
         iifname != \"{ap}\" accept
         # Friends and paying clients may pass; everyone else is dropped,
@@ -185,38 +322,19 @@ impl Firewall {
         out
     }
 
-    fn run(args: &[&str], stdin: Option<&str>) -> Result<String, NftError> {
-        let mut child = Command::new("nft")
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(input) = stdin {
-            let mut pipe = child.stdin.take().expect("piped");
-            pipe.write_all(input.as_bytes())?;
-        }
-        let out = child.wait_with_output()?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() {
-            return Err(NftError::Rejected(stderr.trim().to_string()));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, NftError> {
+        self.backend.run(args, stdin)
     }
 
     /// (Re)install the table: whatever is there before is ours to replace.
     pub fn install(&self) -> Result<(), NftError> {
         // Fail-closed: drop leftovers first, then apply the full table.
-        let _ = Self::run(&["delete", "table", "inet", TABLE], None);
-        Self::run(&["-f", "-"], Some(&self.render())).map(|_| ())
+        let _ = self.run(&["delete", "table", "inet", TABLE], None);
+        self.run(&["-f", "-"], Some(&self.render())).map(|_| ())
     }
 
     pub fn uninstall(&self) -> Result<(), NftError> {
-        match Self::run(&["delete", "table", "inet", TABLE], None) {
+        match self.run(&["delete", "table", "inet", TABLE], None) {
             Ok(_) => Ok(()),
             // Already gone — the desired end state.
             Err(NftError::Rejected(e)) if e.contains("No such file") => Ok(()),
@@ -225,97 +343,308 @@ impl Firewall {
     }
 
     pub fn table_exists(&self) -> bool {
-        Self::run(&["list", "table", "inet", TABLE], None).is_ok()
+        self.run(&["list", "table", "inet", TABLE], None).is_ok()
     }
 
-    fn set_members_raw(&self, set: &str) -> Result<String, NftError> {
-        Self::run(&["list", "set", "inet", TABLE, set], None)
-    }
-
-    /// Current members of a set (with their counters), from kernel output.
-    pub fn set_members(&self, set: &str) -> Result<Vec<SetElement>, NftError> {
-        let out = self.set_members_raw(set)?;
-        Ok(parse_elements(&out))
-    }
-
-    /// Add a MAC to a set. Elements are set *expressions*, which nft only
-    /// parses in a ruleset fed over stdin (`-f -`), so this builds a
-    /// one-line script rather than passing argv tokens.
-    pub fn set_add(&self, set: &str, mac: &MacAddr) -> Result<(), NftError> {
-        let script = format!("add element inet {TABLE} {set} {{ {} }}", mac);
-        match Self::run(&["-f", "-"], Some(&script)) {
-            Ok(_) => Ok(()),
-            // Already present: desired state reached.
-            Err(NftError::Rejected(e)) if e.contains("File exists") => Ok(()),
+    /// Is the installed table still *ours*, and still loaded?
+    ///
+    /// `table_exists` answers "does the kernel know a table by this
+    /// name", which stays true after `nft flush table inet piso` — a
+    /// table with the right name, no rules, and no enforcement. This
+    /// compares the listed ruleset against the rules the paywall
+    /// depends on, so a flushed or foreign table reads as broken and is
+    /// reinstalled instead of being trusted.
+    ///
+    /// Reading is separate from interpreting so a caller can do both in
+    /// one `nft` call (see [`Firewall::inspect`]).
+    pub fn list_table(&self) -> Result<Option<String>, NftError> {
+        match self.run(&["list", "table", "inet", TABLE], None) {
+            Ok(listed) => Ok(Some(listed)),
+            // Missing is a state, not an error: the caller will install.
+            Err(NftError::Rejected(reason)) if reason.contains("No such file") => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    pub fn set_remove(&self, set: &str, mac: &MacAddr) -> Result<(), NftError> {
-        let script = format!("delete element inet {TABLE} {set} {{ {} }}", mac);
-        match Self::run(&["-f", "-"], Some(&script)) {
+    /// One read for the whole tick: `None` when the table is missing,
+    /// flushed, or somebody else's; otherwise every set it holds.
+    pub fn inspect(&self) -> Result<Option<TableSnapshot>, NftError> {
+        let Some(listed) = self.list_table()? else {
+            return Ok(None);
+        };
+        if !self.ruleset_is_ours(&listed) {
+            return Ok(None);
+        }
+        Ok(Some(parse_table_listing(&listed)))
+    }
+
+    /// The rules a listed table must contain to count as enforcing.
+    fn ruleset_is_ours(&self, listed: &str) -> bool {
+        let ap = self.ap_iface.as_str();
+        let mut required: Vec<String> = vec![
+            format!("iifname != \"{ap}\" accept"),
+            format!("ether saddr @{SET_FRIENDS} counter accept"),
+            format!("ether saddr @{SET_ALLOWED} counter accept"),
+            format!("ether saddr @{SET_BLOCKED} counter drop"),
+            // The catch-all: unknown devices are dropped, not passed.
+            "counter drop".to_string(),
+        ];
+        if self.uplink.is_some() {
+            required.push("masquerade".to_string());
+        }
+        if self.portal_enabled {
+            required.push("redirect to :80".to_string());
+        }
+        // `nft list table` normalizes whitespace and prints counter
+        // values inline (`counter packets 3 bytes 252 accept`), so both
+        // sides are reduced to the rule text alone before comparing.
+        let listed = normalize_ruleset(listed);
+        required
+            .iter()
+            .all(|rule| listed.contains(&normalize_ruleset(rule)))
+    }
+
+    /// Apply set changes in one `nft` run. Every call costs a process
+    /// spawn and a ruleset transaction, so a reconcile tick that changes
+    /// 40 devices used to mean 40 of them; this makes it one, and the
+    /// transaction is atomic — a revoked device is never briefly in no
+    /// set at all, and a granted one never waits for the next tick.
+    ///
+    /// If one element turns out to be stale, `nft` aborts the whole
+    /// script; that case replays the changes one by one so the rest of
+    /// the batch still takes effect.
+    pub fn apply_batch(&self, changes: &[SetChange]) -> Result<(), NftError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let script: String = changes
+            .iter()
+            .map(|change| format!("{}\n", change.render()))
+            .collect();
+        match self.run(&["-f", "-"], Some(&script)) {
             Ok(_) => Ok(()),
-            // Absent: already the desired state.
-            Err(NftError::Rejected(e)) if e.contains("No such file") => Ok(()),
-            Err(e) => Err(e),
+            Err(err) => {
+                // A stale element aborts the whole script; that case is
+                // worth a retry element by element, anything else is not.
+                let stale = matches!(
+                    &err,
+                    NftError::Rejected(reason)
+                        if reason.contains("File exists") || reason.contains("No such file")
+                );
+                if !stale {
+                    return Err(err);
+                }
+                log_warn!("nft rejected a batch ({err}); applying element by element");
+                self.apply_one_by_one(changes)
+            }
+        }
+    }
+
+    /// The slow, tolerant path: one element per `nft` run, where "already
+    /// there" and "already gone" are the desired state rather than
+    /// errors.
+    fn apply_one_by_one(&self, changes: &[SetChange]) -> Result<(), NftError> {
+        for change in changes {
+            let script = format!("{}\n", change.render());
+            match self.run(&["-f", "-"], Some(&script)) {
+                Ok(_) => {}
+                Err(NftError::Rejected(e))
+                    if e.contains("File exists") || e.contains("No such file") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One set change, with the set named by type rather than by string:
+/// set names reach the ruleset script, so they never come from input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetName {
+    Allowed,
+    Friends,
+    Blocked,
+    AllowedV4,
+    BlockedV4,
+}
+
+impl SetName {
+    pub fn name(self) -> &'static str {
+        match self {
+            SetName::Allowed => SET_ALLOWED,
+            SetName::Friends => SET_FRIENDS,
+            SetName::Blocked => SET_BLOCKED,
+            SetName::AllowedV4 => SET_ALLOWED_V4,
+            SetName::BlockedV4 => SET_BLOCKED_V4,
         }
     }
 }
 
-/// Parse `elements = { aa:bb:… [counter packets N bytes M], … }`
-/// (possibly wrapped over several lines) out of `nft list set` output.
-/// Elements without counters report zeros.
-pub fn parse_elements(output: &str) -> Vec<SetElement> {
-    let mut members = Vec::new();
-    let Some(start) = output.find("elements") else {
-        return members;
-    };
-    let Some(open) = output[start..].find('{') else {
-        return members;
-    };
-    let rest = &output[start + open + 1..];
-    let Some(close) = rest.find('}') else {
-        return members;
-    };
-    for token in rest[..close].split(',') {
-        let mut fields = token.split_whitespace();
-        let (Some(mac), rest) = (fields.next(), fields) else {
-            continue;
-        };
-        let Ok(mac) = mac.parse::<MacAddr>() else {
-            continue;
-        };
-        // Optional: "counter packets N bytes M"
-        let rest: Vec<&str> = rest.collect();
-        let (packets, bytes) = match rest.iter().position(|f| *f == "packets") {
-            Some(i) => (
-                rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
-                rest.iter()
-                    .position(|f| *f == "bytes")
-                    .and_then(|j| rest.get(j + 1).and_then(|v| v.parse().ok()))
-                    .unwrap_or(0),
-            ),
-            None => (0, 0),
-        };
-        members.push(SetElement {
-            mac,
-            packets,
-            bytes,
-        });
-    }
-    members
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetChange {
+    AddMac(SetName, MacAddr),
+    DelMac(SetName, MacAddr),
+    AddV4(SetName, Ipv4Addr),
+    DelV4(SetName, Ipv4Addr),
 }
 
-/// What the reconciler wants vs. what the kernel has.
+impl SetChange {
+    fn render(self) -> String {
+        let (verb, set, element) = match self {
+            SetChange::AddMac(set, mac) => ("add", set, mac.to_string()),
+            SetChange::DelMac(set, mac) => ("delete", set, mac.to_string()),
+            SetChange::AddV4(set, addr) => ("add", set, addr.to_string()),
+            SetChange::DelV4(set, addr) => ("delete", set, addr.to_string()),
+        };
+        format!("{verb} element inet {TABLE} {} {{ {element} }}", set.name())
+    }
+}
+
+/// Rule text with counter values removed: `counter packets 3 bytes 252`
+/// and `counter` both become `counter`, which is what rule comparison
+/// cares about.
+fn normalize_ruleset(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut skip_value = false;
+    for token in text.split_whitespace() {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if token == "packets" || token == "bytes" {
+            skip_value = true;
+            continue;
+        }
+        out.push(token);
+    }
+    out.join(" ")
+}
+
+/// Parse the counters from one element token: everything after the
+/// element is optional, and the shape is `[counter packets N bytes M]`.
+fn token_counters(rest: &[&str]) -> (u64, u64) {
+    match rest.iter().position(|f| *f == "packets") {
+        Some(i) => (
+            rest.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+            rest.iter()
+                .position(|f| *f == "bytes")
+                .and_then(|j| rest.get(j + 1).and_then(|v| v.parse().ok()))
+                .unwrap_or(0),
+        ),
+        None => (0, 0),
+    }
+}
+
+/// The element list of one set block (`elements = { … }`, possibly
+/// wrapped over several lines), or `""` when the set has none.
+fn element_list(block: &str) -> &str {
+    let Some(start) = block.find("elements") else {
+        return "";
+    };
+    let Some(open) = block[start..].find('{') else {
+        return "";
+    };
+    let rest = &block[start + open + 1..];
+    match rest.find('}') {
+        Some(close) => &rest[..close],
+        None => rest,
+    }
+}
+
+/// Split `nft list table` output into `(set name, block text)` pairs.
+fn set_blocks(output: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(String, usize, String)> = None;
+    for line in output.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        if let Some((_, set_indent, text)) = current.as_mut() {
+            if indent <= *set_indent && trimmed.starts_with('}') {
+                let (name, _, text) = current.take().expect("checked above");
+                blocks.push((name, text));
+                continue;
+            }
+            text.push_str(line);
+            text.push('\n');
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("set ")
+            && trimmed.ends_with('{')
+        {
+            let name = rest.trim_end_matches('{').trim().to_string();
+            current = Some((name, indent, String::new()));
+        }
+    }
+    if let Some((name, _, text)) = current {
+        blocks.push((name, text));
+    }
+    blocks
+}
+
+/// Parse `nft list table inet piso`: every set of our table, in one pass.
+///
+/// Elements without counters report zeros. Anything unparseable is
+/// skipped rather than guessed at: this output is the reconciler's view
+/// of the kernel, and a half-written line must not invent membership.
+pub fn parse_table_listing(output: &str) -> TableSnapshot {
+    let mut snapshot = TableSnapshot::default();
+    for (name, block) in set_blocks(output) {
+        let elements = element_list(&block);
+        if elements.trim().is_empty() {
+            continue;
+        }
+        for token in elements.split(',') {
+            let mut fields = token.split_whitespace();
+            let Some(first) = fields.next() else { continue };
+            let rest: Vec<&str> = fields.collect();
+            let (packets, bytes) = token_counters(&rest);
+            match name.as_str() {
+                SET_ALLOWED | SET_FRIENDS | SET_BLOCKED => {
+                    if let Ok(mac) = first.parse::<MacAddr>() {
+                        let element = SetElement {
+                            mac,
+                            packets,
+                            bytes,
+                        };
+                        match name.as_str() {
+                            SET_ALLOWED => snapshot.allowed.push(element),
+                            SET_FRIENDS => snapshot.friends.push(element),
+                            _ => snapshot.blocked.push(element),
+                        }
+                    }
+                }
+                SET_ALLOWED_V4 | SET_BLOCKED_V4 => {
+                    if let Ok(addr) = first.parse::<Ipv4Addr>() {
+                        let element = V4Element {
+                            addr,
+                            packets,
+                            bytes,
+                        };
+                        match name.as_str() {
+                            SET_ALLOWED_V4 => snapshot.allowed_v4.push(element),
+                            _ => snapshot.blocked_v4.push(element),
+                        }
+                    }
+                }
+                // Our table, a set we do not know about: not ours to read.
+                _ => {}
+            }
+        }
+    }
+    snapshot
+}
+
+/// What the reconciler wants vs. what the kernel has: set membership of
+/// any element type (device MACs, client addresses).
 #[derive(Debug, PartialEq, Eq)]
-pub struct SetDiff {
-    pub add: Vec<MacAddr>,
-    pub remove: Vec<MacAddr>,
+pub struct SetDiff<T> {
+    pub add: Vec<T>,
+    pub remove: Vec<T>,
 }
 
-pub fn diff(want: &[MacAddr], have: &[MacAddr]) -> SetDiff {
-    let add: Vec<MacAddr> = want.iter().filter(|m| !have.contains(m)).copied().collect();
-    let remove: Vec<MacAddr> = have.iter().filter(|m| !want.contains(m)).copied().collect();
+pub fn diff<T: PartialEq + Copy>(want: &[T], have: &[T]) -> SetDiff<T> {
+    let add: Vec<T> = want.iter().filter(|m| !have.contains(m)).copied().collect();
+    let remove: Vec<T> = have.iter().filter(|m| !want.contains(m)).copied().collect();
     SetDiff { add, remove }
 }
 
@@ -324,13 +653,13 @@ mod tests {
     use super::*;
 
     fn fw(uplink: Option<&str>) -> Firewall {
-        Firewall {
-            ap_iface: "wlan0".to_string(),
-            uplink: uplink.map(str::to_string),
-            gateway: Ipv4Addr::new(10, 10, 0, 1),
-            panel_port: 8080,
-            portal_enabled: true,
-        }
+        Firewall::system(
+            "wlan0",
+            uplink.map(str::to_string),
+            Ipv4Addr::new(10, 10, 0, 1),
+            8080,
+            true,
+        )
     }
 
     fn mac(s: &str) -> MacAddr {
@@ -343,15 +672,40 @@ mod tests {
         assert!(rules.contains("iifname != \"wlan0\" accept"));
         assert!(rules.contains("ether saddr @allowed counter accept"));
         assert!(rules.contains("counter drop"));
-        // Every policy decision is observable: three set-declaration
-        // counters plus five rule counters (friends, allowed, blocked,
-        // forward drop, input drop). Comment lines are ignored.
+        // Every policy decision is observable: five set declarations
+        // carry counters, plus seven rule counters (blocked downloads,
+        // allowed downloads, friends, allowed, blocked uploads, forward
+        // drop, input drop). Comment lines are ignored.
         let counted = rules
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
             .filter(|l| l.contains("counter"))
             .count();
-        assert_eq!(counted, 8);
+        assert_eq!(counted, 12);
+    }
+
+    #[test]
+    fn download_attribution_never_grants_anything() {
+        let rules = fw(None).render();
+        let forward = rules.split("chain forward").nth(1).expect("forward chain");
+        // The allow-set rule counts and falls through: no verdict.
+        let allowed_at = forward.find("ip daddr @allowed_v4 counter").expect("count");
+        let rules_after = &forward[allowed_at..];
+        assert!(
+            !rules_after
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("accept"),
+            "the download counter must not accept: {rules_after}"
+        );
+        // Blocked addresses are dropped, and before the foreign-traffic
+        // escape hatch, or downloads would never reach the rule.
+        let drop_at = forward
+            .find("ip daddr @blocked_v4 counter drop")
+            .expect("drop");
+        let gate_at = forward.find("iifname != \"wlan0\" accept").expect("gate");
+        assert!(drop_at < gate_at, "{forward}");
     }
 
     #[test]
@@ -473,61 +827,157 @@ mod tests {
         // render() validates; constructing the value must not panic on
         // sane inputs — pathological names panic only if they slip past
         // every caller, so validate_iface itself is tested above.
-        let fw = Firewall {
-            ap_iface: "wlan0".into(),
-            uplink: Some("usb0".into()),
-            gateway: Ipv4Addr::new(10, 10, 0, 1),
-            panel_port: 8080,
-            portal_enabled: true,
-        };
+        let fw = Firewall::system(
+            "wlan0",
+            Some("usb0".into()),
+            Ipv4Addr::new(10, 10, 0, 1),
+            8080,
+            true,
+        );
         assert!(fw.render().contains("table inet piso"));
     }
 
-    #[test]
-    fn parses_wrapped_element_lists() {
-        let out = "
+    /// A `nft list table inet piso` capture: three MAC sets with
+    /// counters, two address sets, and a foreign set we must ignore.
+    const LISTED: &str = "
 table inet piso {
-    set allowed {
-        type ether_addr
-        elements = { aa:bb:cc:dd:ee:01, 11:22:33:44:55:66,
-            77:88:99:aa:bb:cc }
-    }
+\tset allowed {
+\t\ttype ether_addr
+\t\tcounter
+\t\telements = { 42:61:7e:6c:ee:d2 counter packets 70 bytes 4620,
+\t\t\taa:bb:cc:dd:ee:01 counter packets 0 bytes 0 }
+\t}
+
+\tset friends {
+\t\ttype ether_addr
+\t\tcounter
+\t}
+
+\tset blocked {
+\t\ttype ether_addr
+\t\tcounter
+\t\telements = { 11:22:33:44:55:66 counter packets 3 bytes 252 }
+\t}
+
+\tset allowed_v4 {
+\t\ttype ipv4_addr
+\t\tcounter
+\t\telements = { 10.10.0.5 counter packets 12 bytes 900 }
+\t}
+
+\tset blocked_v4 {
+\t\ttype ipv4_addr
+\t\tcounter
+\t}
+
+\tset somebody_elses {
+\t\ttype inet_service
+\t\telements = { 999 }
+\t}
+
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy accept;
+\t\tiifname != \"wlan0\" accept
+\t\tether saddr @friends counter accept
+\t\tether saddr @blocked counter drop
+\t}
 }
 ";
-        let members = parse_elements(out);
-        assert_eq!(members.len(), 3);
-        assert_eq!(members[0].mac.to_string(), "aa:bb:cc:dd:ee:01");
-        assert_eq!(members[2].mac.to_string(), "77:88:99:aa:bb:cc");
-        // No counters shown → zeros.
-        assert!(members.iter().all(|e| e.packets == 0 && e.bytes == 0));
-    }
 
     #[test]
-    fn parses_element_counters() {
-        let out = "
-table inet piso {
-    set allowed {
-        type ether_addr
-        counter
-        elements = { 42:61:7e:6c:ee:d2 counter packets 70 bytes 4620,
-            aa:bb:cc:dd:ee:01 counter packets 0 bytes 0 }
-    }
-}
-";
-        let members = parse_elements(out);
-        assert_eq!(members.len(), 2);
-        assert_eq!(members[0].mac.to_string(), "42:61:7e:6c:ee:d2");
-        assert_eq!(members[0].packets, 70);
-        assert_eq!(members[0].bytes, 4620);
-        assert_eq!(members[1].packets, 0);
-        assert_eq!(members[1].bytes, 0);
+    fn parses_every_set_of_the_table_in_one_pass() {
+        let snapshot = parse_table_listing(LISTED);
+        assert_eq!(snapshot.allowed.len(), 2);
+        assert_eq!(snapshot.allowed[0].mac.to_string(), "42:61:7e:6c:ee:d2");
+        assert_eq!(snapshot.allowed[0].packets, 70);
+        assert_eq!(snapshot.allowed[0].bytes, 4620);
+        assert_eq!(snapshot.allowed[1].bytes, 0, "no counters means zeros");
+        assert!(snapshot.friends.is_empty(), "an empty set has no elements");
+        assert_eq!(snapshot.blocked.len(), 1);
+        assert_eq!(snapshot.blocked[0].bytes, 252);
+        assert_eq!(snapshot.allowed_v4.len(), 1);
+        assert_eq!(snapshot.allowed_v4[0].addr.to_string(), "10.10.0.5");
+        assert_eq!(snapshot.allowed_v4[0].bytes, 900);
+        assert!(snapshot.blocked_v4.is_empty());
+        // A set we do not know about is not ours to read.
+        assert_eq!(snapshot.macs(SetName::Allowed).len(), 2);
     }
 
     #[test]
     fn parses_empty_or_absent_elements() {
-        assert!(parse_elements("table inet piso { set allowed { type ether_addr } }").is_empty());
-        assert!(parse_elements("no elements here").is_empty());
-        assert!(parse_elements("elements = { }").is_empty());
+        let snapshot = parse_table_listing("table inet piso { set allowed { type ether_addr } }");
+        assert!(snapshot.allowed.is_empty());
+        assert!(parse_table_listing("no sets here").allowed.is_empty());
+        assert!(
+            parse_table_listing("set allowed {\n elements = { }\n}")
+                .allowed
+                .is_empty()
+        );
+        // Half-written lines are skipped, never guessed at.
+        let half =
+            "set allowed {\n type ether_addr\n elements = { aa:bb:cc:dd:ee:01,\n junk\n }\n}";
+        assert_eq!(parse_table_listing(half).allowed.len(), 1);
+    }
+
+    #[test]
+    fn integrity_check_notices_a_flushed_or_foreign_table() {
+        let fw = fw(None);
+        let installed = fw.render();
+        // `nft list table` prints rules with counter values inline; that
+        // is the spelling the check has to accept.
+        let listed = installed.replace("counter", "counter packets 3 bytes 252");
+        assert!(fw.ruleset_is_ours(&listed), "our own ruleset must pass");
+        assert!(
+            fw.ruleset_is_ours(&installed),
+            "and so must the un-instrumented text"
+        );
+
+        // Flushed: same table, same sets, no rules.
+        let flushed = "table inet piso {\n\tset allowed {\n\t\ttype ether_addr\n\t}\n\tchain forward {\n\t}\n}";
+        assert!(
+            !fw.ruleset_is_ours(flushed),
+            "a table without the enforcing rules is not intact"
+        );
+
+        // Foreign: right name, someone else's rules.
+        let foreign =
+            "table inet piso {\n\tchain forward {\n\t\tcounter packets 1 bytes 60 accept\n\t}\n}";
+        assert!(!fw.ruleset_is_ours(foreign));
+        assert!(!fw.ruleset_is_ours(""));
+    }
+
+    #[test]
+    fn integrity_check_follows_the_configured_shape() {
+        // With an uplink and the portal on, the NAT and redirect rules are
+        // part of what makes the table ours.
+        let fw = fw(Some("usb0"));
+        let listed = fw.render();
+        assert!(fw.ruleset_is_ours(&listed));
+        let without_masquerade = listed.replace("masquerade", "");
+        assert!(!fw.ruleset_is_ours(&without_masquerade));
+        let without_redirect = listed.replace("redirect to :80", "");
+        assert!(!fw.ruleset_is_ours(&without_redirect));
+    }
+
+    #[test]
+    fn batch_scripts_are_one_script_with_typed_set_names() {
+        let changes = [
+            SetChange::AddMac(SetName::Allowed, mac("aa:bb:cc:dd:ee:01")),
+            SetChange::DelMac(SetName::Blocked, mac("aa:bb:cc:dd:ee:01")),
+            SetChange::AddV4(SetName::AllowedV4, Ipv4Addr::new(10, 10, 0, 5)),
+            SetChange::DelV4(SetName::BlockedV4, Ipv4Addr::new(10, 10, 0, 6)),
+        ];
+        let script: String = changes
+            .iter()
+            .map(|c| format!("{}\n", c.render()))
+            .collect();
+        assert_eq!(
+            script,
+            "add element inet piso allowed { aa:bb:cc:dd:ee:01 }\n\
+             delete element inet piso blocked { aa:bb:cc:dd:ee:01 }\n\
+             add element inet piso allowed_v4 { 10.10.0.5 }\n\
+             delete element inet piso blocked_v4 { 10.10.0.6 }\n"
+        );
     }
 
     #[test]
@@ -541,7 +991,7 @@ table inet piso {
 
     #[test]
     fn diff_empty_both_ways() {
-        let d = diff(&[], &[]);
+        let d = diff::<MacAddr>(&[], &[]);
         assert!(d.add.is_empty() && d.remove.is_empty());
         let same = vec![mac("aa:bb:cc:dd:ee:01")];
         let d = diff(&same, &same);

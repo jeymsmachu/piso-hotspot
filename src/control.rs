@@ -61,6 +61,10 @@ pub struct StatusInfo {
     pub admin_passphrase: String,
     /// Live panel sessions.
     pub sessions: usize,
+    /// Anything that is wrong right now, in sentences an operator can act
+    /// on. Empty means the hotspot is doing what `status` claims.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -202,6 +206,7 @@ mod tests {
     #[test]
     fn status_info_roundtrips() {
         let s = StatusInfo {
+            warnings: Vec::new(),
             mode: "hotspot".into(),
             ap_iface: "wlan0".into(),
             uplink: Some("usb0".into()),
