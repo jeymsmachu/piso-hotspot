@@ -67,6 +67,11 @@ pub struct Config {
     /// Sales and audit rows are kept forever.
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+    /// How many friends the list may hold; `0` means no limit. Friends
+    /// bypass the paywall forever, so a cap is the difference between
+    /// "my friends' phones" and "the whole barangay".
+    #[serde(default = "default_max_friends")]
+    pub max_friends: u32,
     /// DNS servers handed to clients, e.g. `["1.1.1.1", "9.9.9.9"]`.
     /// Empty (the default) uses the host's own resolvers, which is what a
     /// `--wifi-uplink` hotspot needs.
@@ -78,12 +83,61 @@ fn default_retention_days() -> u32 {
     30
 }
 
+fn default_max_friends() -> u32 {
+    50
+}
+
 /// Panel login. Empty passphrase = a fresh random one per start,
 /// printed by `piso-hotspot status`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdminSettings {
     pub passphrase: String,
+    /// How the panel is served. HTTPS by default: the panel grants and
+    /// revokes access and shows the login secret, and on a shared uplink
+    /// LAN plain HTTP hands all of that to anyone listening.
+    pub tls: TlsMode,
+    /// Certificate and key to use when `tls` is `file`.
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+    /// Address the panel binds. `0.0.0.0` (the default) is reachable
+    /// from the hotspot and, when there is an uplink, from that network
+    /// too — which is how a phone on either side can run it. Narrow it on
+    /// a network you do not trust.
+    pub bind: Ipv4Addr,
+}
+
+impl Default for AdminSettings {
+    fn default() -> Self {
+        Self {
+            passphrase: String::new(),
+            tls: TlsMode::default(),
+            cert_file: None,
+            key_file: None,
+            bind: Ipv4Addr::UNSPECIFIED,
+        }
+    }
+}
+
+/// How the admin panel is served.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// Generate a self-signed certificate once and keep it: encrypted,
+    /// with a one-time browser warning per device.
+    #[default]
+    Auto,
+    /// Serve plain HTTP (for setups that terminate TLS in front of us).
+    Off,
+    /// Use the certificate and key named in `cert_file`/`key_file`.
+    File,
+}
+
+impl TlsMode {
+    /// True when the panel is meant to be encrypted.
+    pub fn is_tls(self) -> bool {
+        !matches!(self, TlsMode::Off)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +232,7 @@ impl Default for Config {
             ui: UiSettings::default(),
             bandwidth: BandwidthSettings::default(),
             retention_days: default_retention_days(),
+            max_friends: default_max_friends(),
             upstream_dns: Vec::new(),
         }
     }
@@ -356,6 +411,14 @@ impl Config {
                 "admin.passphrase must be empty (random per start) or at least 8 characters"
                     .to_string(),
             );
+        }
+        if self.admin.tls == TlsMode::File {
+            match (&self.admin.cert_file, &self.admin.key_file) {
+                (Some(_), Some(_)) => {}
+                _ => problems.push(
+                    "admin.tls = \"file\" needs admin.cert_file and admin.key_file".to_string(),
+                ),
+            }
         }
         for (name, cap) in [
             (

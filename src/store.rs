@@ -362,6 +362,11 @@ pub fn touch_leased_device(
     Ok(())
 }
 
+/// How many devices are on the friend list.
+pub fn count_friends(conn: &Connection) -> Result<i64, StoreError> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM friends", [], |r| r.get(0))?)
+}
+
 pub fn count_devices(conn: &Connection) -> Result<i64, StoreError> {
     Ok(conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))?)
 }

@@ -21,6 +21,7 @@ mod radio;
 mod shaper;
 mod store;
 mod text;
+mod tls;
 mod ufw;
 mod viface;
 mod wireless;

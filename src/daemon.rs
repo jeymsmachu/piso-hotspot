@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -301,6 +301,13 @@ pub(crate) fn health(d: &mut Daemon, live: bool) -> Vec<String> {
         warnings.push(note.clone());
     }
 
+    if d.cfg.admin.tls.is_tls() && d.panel_tls.is_none() {
+        warnings.push(
+            "the admin panel is serving plain HTTP: its certificate could not be prepared \
+             (see the log)"
+                .to_string(),
+        );
+    }
     if let Some(e) = &d.panel_error {
         warnings.push(format!("the admin panel is not serving: {e}"));
     }
@@ -540,6 +547,9 @@ pub(crate) struct Daemon {
     /// Set by a restarted helper or a revoked rule: the next tick must
     /// bring the kernel back in step immediately.
     pub(crate) needs_reconcile: bool,
+    /// Certificate and key for the panel when it serves HTTPS; `None`
+    /// means plain HTTP.
+    pub(crate) panel_tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Why the panel or the portal is not serving, when that happened:
     /// both are optional services, and a silent failure reads as "the
     /// panel is down and nothing says why".
@@ -567,7 +577,22 @@ impl Daemon {
     /// may have changed (a roam, a resume, a DHCP renewal) so `status`
     /// never advertises a dead URL.
     pub(crate) fn compute_panel_urls(&self) -> Vec<String> {
-        panel_urls(self.fw.gateway, self.cfg.ap.port, self.fw.uplink.as_deref())
+        panel_urls(
+            self.panel_scheme(),
+            self.fw.gateway,
+            self.cfg.ap.port,
+            self.fw.uplink.as_deref(),
+        )
+    }
+
+    /// `https` when the panel really is serving TLS, `http` otherwise —
+    /// a URL that lies about its scheme is worse than a plain one.
+    pub(crate) fn panel_scheme(&self) -> &'static str {
+        if self.panel_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 }
 
@@ -653,6 +678,10 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         (cfg.admin.passphrase.clone(), false)
     };
 
+    // How the panel is served, decided here so `status` advertises the
+    // right scheme from its first answer.
+    let panel_tls = prepare_panel_tls(&cfg, &plan);
+
     // What channel the AP beacons on: the operator's, or — in
     // `--wifi-uplink` — the station's, which the single radio forces.
     let ap_channel = plan.station_channel.unwrap_or(cfg.ap.channel);
@@ -673,6 +702,7 @@ fn run_inner(opts: Opts) -> Result<(), String> {
         restart_notes: Vec::new(),
         ap_channel,
         needs_reconcile: false,
+        panel_tls,
         panel_error: None,
         portal_error: None,
         ip_forward_prev: None,
@@ -689,6 +719,8 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     log_info!("hotspot up; panel: {:?}", daemon.panel_urls);
 
     let port = daemon.cfg.ap.port;
+    let panel_bind = daemon.cfg.admin.bind;
+    let panel_tls = daemon.panel_tls.clone();
     let (portal_enabled, portal_gateway) = (daemon.cfg.portal.enabled, daemon.fw.gateway);
     let daemon = Arc::new(Mutex::new(daemon));
     serve(Arc::clone(&daemon));
@@ -702,7 +734,9 @@ fn run_inner(opts: Opts) -> Result<(), String> {
     {
         let panel_state = Arc::clone(&daemon);
         std::thread::spawn(move || {
-            if let Err(e) = crate::http::spawn_panel(Arc::clone(&panel_state), port) {
+            if let Err(e) =
+                crate::http::spawn_panel(Arc::clone(&panel_state), panel_bind, port, panel_tls)
+            {
                 // The paywall and CLI keep working without the panel, but
                 // `status` and the log both have to say so.
                 log_error!("panel unavailable: {e}");
@@ -749,17 +783,60 @@ struct Plan {
     station_channel: Option<u8>,
 }
 
+/// Decide how the panel is served: the operator's own certificate, a
+/// self-signed one generated and kept, or plain HTTP. A failure here is
+/// reported, not fatal — the hotspot works without a panel, and `status`
+/// says why there is not one.
+fn prepare_panel_tls(cfg: &Config, plan: &Plan) -> Option<(PathBuf, PathBuf)> {
+    match cfg.admin.tls {
+        config::TlsMode::Off => {
+            log_warn!(
+                "the admin panel is serving plain HTTP (admin.tls = \"off\"): \
+                 a session cookie on a shared network is a free pass"
+            );
+            None
+        }
+        config::TlsMode::File => match (cfg.admin.cert_file.clone(), cfg.admin.key_file.clone()) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            // Validation refuses this combination, so this is belt and
+            // braces rather than a real path.
+            _ => {
+                log_error!("admin.tls = \"file\" needs admin.cert_file and admin.key_file");
+                None
+            }
+        },
+        config::TlsMode::Auto => {
+            let uplink_ip = plan.uplink.as_deref().and_then(iface_ipv4);
+            let hostname = fs::read_to_string("/etc/hostname")
+                .map(|name| name.trim().to_string())
+                .unwrap_or_default();
+            let names = crate::tls::certificate_names(
+                &plan.gateway.to_string(),
+                uplink_ip.as_deref(),
+                &hostname,
+            );
+            match crate::tls::ensure_certificate(&config::config_dir(), &names, None) {
+                Ok(paths) => Some(paths),
+                Err(e) => {
+                    log_error!("cannot prepare the panel certificate: {e}");
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Every address the panel answers on: localhost, the AP gateway, and
 /// the uplink side (so a tethered phone or a LAN device can reach it).
-fn panel_urls(gateway: Ipv4Addr, port: u16, uplink: Option<&str>) -> Vec<String> {
+fn panel_urls(scheme: &str, gateway: Ipv4Addr, port: u16, uplink: Option<&str>) -> Vec<String> {
     let mut urls = vec![
-        format!("http://127.0.0.1:{port}"),
-        format!("http://{gateway}:{port}"),
+        format!("{scheme}://127.0.0.1:{port}"),
+        format!("{scheme}://{gateway}:{port}"),
     ];
     if let Some(iface) = uplink
         && let Some(ip) = iface_ipv4(iface)
     {
-        urls.push(format!("http://{ip}:{port}"));
+        urls.push(format!("{scheme}://{ip}:{port}"));
     }
     urls
 }
@@ -1331,6 +1408,20 @@ pub(crate) fn dispatch_actor(d: &Arc<Mutex<Daemon>>, req: Request, actor: &str) 
             Request::Friend { mac, label } => {
                 let mac: crate::mac::MacAddr = mac.parse().map_err(|e| format!("bad mac: {e}"))?;
                 let label = crate::text::clean_label(label.as_deref())?;
+                // Friends are permanent and unlimited: a cap is what keeps
+                // "free internet for a friend" from becoming a policy.
+                if !store::is_friend(&d.conn, &mac.to_string()).map_err(err_str)?
+                    && d.cfg.max_friends > 0
+                    && store::count_friends(&d.conn).map_err(err_str)?
+                        >= i64::from(d.cfg.max_friends)
+                {
+                    return Err(format!(
+                        "the friend list is full ({} of {}); unfriend someone first, or raise \
+                         max_friends in the configuration",
+                        store::count_friends(&d.conn).map_err(err_str)?,
+                        d.cfg.max_friends
+                    ));
+                }
                 store::friend(&d.conn, &mac, label.as_deref(), now_ts).map_err(err_str)?;
                 store::record_action(
                     &d.conn,
@@ -1714,10 +1805,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conn = crate::store::open(&dir.join("state.db")).unwrap();
+        // A fake kernel: `dispatch` really does change firewall state, and
+        // a test must not need root (or a real nftables) for that.
+        let fake = crate::nft::FakeNft::new();
         Arc::new(Mutex::new(Daemon {
             cfg: Config::default(),
             conn,
-            fw: Firewall::system("wlan0", None, Ipv4Addr::new(10, 10, 0, 1), 8080, true),
+            fw: Firewall::with_backend(
+                Arc::clone(&fake) as Arc<dyn crate::nft::NftBackend>,
+                "wlan0",
+                None,
+                Ipv4Addr::new(10, 10, 0, 1),
+                8080,
+                true,
+            ),
             mode: "offline".into(),
             started_at: 0,
             auth: crate::auth::AuthState::new("test-passphrase".into()),
@@ -1731,12 +1832,48 @@ mod tests {
             restart_notes: Vec::new(),
             ap_channel: 6,
             needs_reconcile: false,
+            panel_tls: None,
             panel_error: None,
             portal_error: None,
             ip_forward_prev: None,
             hostapd: None,
             dnsmasq: None,
         }))
+    }
+
+    #[test]
+    fn the_friend_list_has_a_cap() {
+        let d = offline_daemon("friend-cap");
+        d.lock().unwrap().cfg.max_friends = 2;
+        let grant = |mac: &str| Request::Friend {
+            mac: mac.to_string(),
+            label: None,
+        };
+
+        for mac in ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"] {
+            assert!(dispatch(&d, grant(mac)).ok, "{mac} should fit");
+        }
+        let refused = dispatch(&d, grant("aa:bb:cc:dd:ee:03"));
+        assert!(!refused.ok);
+        assert!(
+            refused
+                .error
+                .unwrap_or_default()
+                .contains("friend list is full"),
+            "the refusal has to explain itself"
+        );
+        // Re-friending somebody already on the list is not a new slot.
+        assert!(dispatch(&d, grant("aa:bb:cc:dd:ee:01")).ok);
+
+        // Everything that happened is in the audit trail, with its actor.
+        let conn = &d.lock().unwrap().conn;
+        let actions = crate::store::recent_actions(conn, 10).unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.action == "friend" && a.actor == "cli")
+        );
+        assert_eq!(crate::store::count_friends(conn).unwrap(), 2);
     }
 
     #[test]

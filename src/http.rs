@@ -7,6 +7,8 @@
 //!
 //! The captive portal is a separate server — see [`crate::portal`].
 
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
@@ -26,26 +28,43 @@ const SESSION_COOKIE: &str = "piso_session";
 
 pub type Shared = Arc<Mutex<Daemon>>;
 
-/// Serve the panel on `0.0.0.0:port` until the process dies.
-/// Returns an error string when the socket cannot be bound (the
-/// hotspot itself keeps running; the CLI remains fully usable).
-pub fn spawn_panel(state: Shared, port: u16) -> Result<(), String> {
+/// Serve the panel until the process dies.
+///
+/// With `tls` the port speaks HTTPS using that certificate; without it,
+/// plain HTTP. Returns an error string when the socket cannot be bound or
+/// the certificate cannot be read (the hotspot itself keeps running; the
+/// CLI remains fully usable, and `status` reports why the panel is down).
+pub fn spawn_panel(
+    state: Shared,
+    bind: Ipv4Addr,
+    port: u16,
+    tls: Option<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-            .await
-            .map_err(|e| format!("cannot bind panel on port {port}: {e}"))?;
-        let router = panel_router(state);
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .map_err(|e| format!("panel server: {e}"))
+        let address = SocketAddr::from((bind, port));
+        let service = panel_router(state).into_make_service_with_connect_info::<SocketAddr>();
+        match tls {
+            Some((cert, key)) => {
+                let config = crate::tls::rustls_config(&cert, &key).await?;
+                axum_server::bind_rustls(address, config)
+                    .serve(service)
+                    .await
+                    .map_err(|e| format!("panel server (tls): {e}"))
+            }
+            None => {
+                let listener = tokio::net::TcpListener::bind(address)
+                    .await
+                    .map_err(|e| format!("cannot bind panel on {address}: {e}"))?;
+                axum::serve(listener, service)
+                    .await
+                    .map_err(|e| format!("panel server: {e}"))
+            }
+        }
     })
 }
 
@@ -113,35 +132,44 @@ fn token_from(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
-fn session_cookie(token: &str) -> String {
+/// The session cookie. `Secure` is set whenever the panel is serving
+/// TLS: a browser would refuse an insecure cookie otherwise, and setting
+/// it on plain HTTP would silently break logging in.
+fn session_cookie(token: &str, secure: bool) -> String {
     format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        SESSION_IDLE.as_secs()
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+        SESSION_IDLE.as_secs(),
+        if secure { "; Secure" } else { "" }
     )
 }
 
-/// Returns the 401 response when the caller has no valid session.
-fn auth_error(state: &Shared, headers: &HeaderMap) -> Option<Response> {
-    let valid = token_from(headers)
+/// Is this request carrying a valid session, issued to this address?
+///
+/// Binding the session to the address it was issued to is what makes a
+/// sniffed cookie useless to a different device (the panel is plain
+/// LAN-reachable, and the uplink can be somebody else's network).
+fn session_valid(state: &Shared, headers: &HeaderMap, ip: &str) -> bool {
+    token_from(headers)
         .map(|token| {
             state
                 .lock()
-                .map(|mut d| d.auth.validate(token))
+                .map(|mut d| d.auth.validate(token, ip))
                 .unwrap_or(false)
         })
-        .unwrap_or(false);
-    (!valid).then(|| error(StatusCode::UNAUTHORIZED, "not logged in"))
+        .unwrap_or(false)
 }
 
-async fn auth_check(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    let authenticated = token_from(&headers)
-        .map(|token| {
-            state
-                .lock()
-                .map(|mut d| d.auth.validate(token))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+/// Returns the 401 response when the caller has no valid session.
+fn auth_error(state: &Shared, headers: &HeaderMap, ip: &str) -> Option<Response> {
+    (!session_valid(state, headers, ip)).then(|| error(StatusCode::UNAUTHORIZED, "not logged in"))
+}
+
+async fn auth_check(
+    State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let authenticated = session_valid(&state, &headers, &addr.ip().to_string());
     Json(json!({ "authenticated": authenticated })).into_response()
 }
 
@@ -151,23 +179,27 @@ async fn login(
     Json(body): Json<LoginBody>,
 ) -> Response {
     let ip = addr.ip().to_string();
-    let result = state
-        .lock()
-        .map(|mut d| d.auth.login(&ip, &body.passphrase));
+    let (result, secure) = match state.lock() {
+        Ok(mut d) => {
+            let secure = d.panel_tls.is_some();
+            (d.auth.login(&ip, &body.passphrase), secure)
+        }
+        Err(_) => (Err(LoginError::BadPassphrase), false),
+    };
     match result {
-        Ok(Ok(token)) => {
+        Ok(token) => {
             log_info!("panel login ok from {ip}");
             (
-                [(header::SET_COOKIE, session_cookie(&token))],
+                [(header::SET_COOKIE, session_cookie(&token, secure))],
                 Json(json!({ "ok": true })),
             )
                 .into_response()
         }
-        Ok(Err(LoginError::BadPassphrase)) => {
+        Err(LoginError::BadPassphrase) => {
             log_warn!("panel login failed from {ip} (wrong passphrase)");
             error(StatusCode::UNAUTHORIZED, "wrong passphrase")
         }
-        Ok(Err(LoginError::LockedOut(secs))) => {
+        Err(LoginError::LockedOut(secs)) => {
             log_warn!("panel login refused from {ip}: locked out for {secs}s");
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -176,21 +208,25 @@ async fn login(
             )
                 .into_response()
         }
-        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "state poisoned"),
     }
 }
 
 async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let mut secure = false;
     if let Some(token) = token_from(&headers)
         && let Ok(mut d) = state.lock()
     {
         d.auth.logout(token);
+        secure = d.panel_tls.is_some();
         log_info!("panel logout");
     }
     (
         [(
             header::SET_COOKIE,
-            format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0"),
+            format!(
+                "{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0{}",
+                if secure { "; Secure" } else { "" }
+            ),
         )],
         Json(json!({ "ok": true })),
     )
@@ -204,8 +240,12 @@ async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
 /// The numbers come from the daemon's last reconciler tick, never from a
 /// fresh `nft` call: a dashboard open on three phones must not run the
 /// kernel's rule dump three times every three seconds.
-async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let Some(resp) = auth_error(&state, &headers) {
+async fn state_payload(
+    State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = auth_error(&state, &headers, &addr.ip().to_string()) {
         return resp;
     }
     let d = match state.lock() {
@@ -290,8 +330,12 @@ async fn state_payload(State(state): State<Shared>, headers: HeaderMap) -> Respo
 /// poll would scatter it through browser history, devtools and any
 /// screenshot of the dashboard. The CLI (`piso-hotspot status`) and an
 /// explicit click here are the only ways to read it back.
-async fn passphrase_payload(State(state): State<Shared>, headers: HeaderMap) -> Response {
-    if let Some(resp) = auth_error(&state, &headers) {
+async fn passphrase_payload(
+    State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = auth_error(&state, &headers, &addr.ip().to_string()) {
         return resp;
     }
     match state.lock() {
@@ -315,7 +359,7 @@ async fn control(
     headers: HeaderMap,
     Json(req): Json<CtlRequest>,
 ) -> Response {
-    if let Some(resp) = auth_error(&state, &headers) {
+    if let Some(resp) = auth_error(&state, &headers, &addr.ip().to_string()) {
         return resp;
     }
     // The audit trail names the lane that asked: the root socket is
